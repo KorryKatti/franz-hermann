@@ -14,21 +14,21 @@ import (
 )
 
 type Session struct {
-	SessionKey       int    `json:"session_key"`
-	SessionType      string `json:"session_type"`
-	SessionName      string `json:"session_name"`
-	DateStart        string `json:"date_start"`
-	DateEnd          string `json:"date_end"`
-	MeetingKey       int    `json:"meeting_key"`
-	CircuitKey       int    `json:"circuit_key"`
-	CircuitShortName string `json:"circuit_short_name"`
-	CountryKey       int    `json:"country_key"`
-	CountryCode      string `json:"country_code"`
-	CountryName      string `json:"country_name"`
-	Location         string `json:"location"`
-	GMTOffset        string `json:"gmt_offset"`
-	Year             int    `json:"year"`
-	IsCancelled      bool   `json:"is_cancelled"`
+	SessionKey       int       `json:"session_key"`
+	SessionType      string    `json:"session_type"`
+	SessionName      string    `json:"session_name"`
+	DateStart        time.Time `json:"date_start"`
+	DateEnd          time.Time `json:"date_end"`
+	MeetingKey       int       `json:"meeting_key"`
+	CircuitKey       int       `json:"circuit_key"`
+	CircuitShortName string    `json:"circuit_short_name"`
+	CountryKey       int       `json:"country_key"`
+	CountryCode      string    `json:"country_code"`
+	CountryName      string    `json:"country_name"`
+	Location         string    `json:"location"`
+	GMTOffset        string    `json:"gmt_offset"`
+	Year             int       `json:"year"`
+	IsCancelled      bool      `json:"is_cancelled"`
 }
 
 type RaceCache struct {
@@ -99,25 +99,25 @@ func getStatus() string {
 
 	now := time.Now().UTC()
 
-	var raceDay *Session
+	var raceDay Session
 	var raceDayStart time.Time
+	foundRaceDay := false
 
-	var next *Session
+	var next Session
 	var nextDate time.Time
+	foundNext := false
 
 	for i := range races {
-		start, err := time.Parse(time.RFC3339, races[i].DateStart)
-		if err != nil {
-			continue
-		}
+		start := races[i].DateStart
 
 		remaining := start.Sub(now)
 
 		// Inside the race-day window: from 1h before the start up to 12h after.
 		if remaining <= raceDayLead && remaining > -raceDayGrace {
-			if raceDay == nil || start.Before(raceDayStart) {
-				raceDay = &races[i]
+			if foundRaceDay == false || start.Before(raceDayStart) {
+				raceDay = races[i]
 				raceDayStart = start
+				foundRaceDay = true
 			}
 			continue
 		}
@@ -127,19 +127,20 @@ func getStatus() string {
 			continue
 		}
 
-		if next == nil || start.Before(nextDate) {
-			next = &races[i]
+		if foundNext == false || start.Before(nextDate) {
+			next = races[i]
 			nextDate = start
+			foundNext = true
 		}
 	}
 
-	raceUnderway.Store(raceDay != nil)
+	raceUnderway.Store(foundRaceDay)
 
-	if raceDay != nil {
+	if foundRaceDay {
 		return fmt.Sprintf("🏁 RACE DAY at %s", raceDay.Location)
 	}
 
-	if next == nil {
+	if !foundNext {
 		return "🏁 No upcoming races"
 	}
 
@@ -162,37 +163,140 @@ func getStatus() string {
 	return fmt.Sprintf(" %s | %d %s until race", next.Location, days, unit)
 }
 
-func getSessionKey(data []byte, which string) string {
-	// possible thigs in which is prev and curr , if prev return prev session id and if curr return today's session id and if not found default to prev
-
-	return ""
+type driverStandings struct {
+	MeetingKey      int     `json:"meeting_key"`
+	SessionKey      int     `json:"session_key"`
+	DriverNumber    int     `json:"driver_number"`
+	PositionStart   int     `json:"position_start"`
+	PositionCurrent int     `json:"position_current"`
+	PointsStart     float64 `json:"points_start"`
+	PointsCurrent   float64 `json:"points_current"`
 }
 
-func getDriverStandings() {
-	// so the thing here is it will take session id of last race conducted and give top 10
-	data, err := os.ReadFile("data/race.json")
+type driverStandingCache struct {
+	UpdatedAt time.Time         `json:"updated_at"`
+	Standings []driverStandings `json:"standings"`
+}
 
-	if err == nil {
-		var cache RaceCache
-		if json.Unmarshal(data, &cache) == nil &&
-			!cache.UpdatedAt.IsZero() &&
-			time.Since(cache.UpdatedAt) < 72*time.Hour {
-			// return cache.Races, nil
-			log.Printf("Issue in driver cache have a look , occured at ", time.Now())
+func getSessionKey(data []byte, which string) int {
+	// possible thigs in which is prev and curr , if prev return prev session id and if curr return today's session id and if not found default to prev
+	var cache RaceCache
+
+	if err := json.Unmarshal(data, &cache); err != nil {
+		return 0
+	}
+	now := time.Now().UTC()
+	var previous Session
+	var current Session
+	foundPrevious := false
+	foundCurrent := false
+
+	for _, race := range cache.Races {
+
+		if race.IsCancelled || race.SessionName != "Race" {
+			continue
+		}
+
+		// Find most recently completed race
+		if race.DateEnd.Before(now) {
+			if !foundPrevious || race.DateEnd.After(previous.DateEnd) {
+				previous = race
+				foundPrevious = true
+			}
+		}
+
+		// Find today's race
+		if race.DateStart.Year() == now.Year() &&
+			race.DateStart.YearDay() == now.YearDay() &&
+			!race.DateStart.After(now) {
+
+			current = race
+			foundCurrent = true
 		}
 	}
 
-	session_key := getSessionKey(data, "prev") // todo
+	if which == "curr" && foundCurrent {
+		return current.SessionKey
+	}
+
+	if foundPrevious {
+		return previous.SessionKey
+	}
+
+	return 0
+}
+
+func getDriverStandings() ([]driverStandings, error) {
+	// so the thing here is it will take session id of last race conducted and give top 10
+	data, err := os.ReadFile("data/standings.json")
+
+	if err == nil {
+		var cache driverStandingCache
+		if json.Unmarshal(data, &cache) == nil &&
+			!cache.UpdatedAt.IsZero() &&
+			time.Since(cache.UpdatedAt) < 72*time.Hour {
+			if len(cache.Standings) > 10 {
+				return cache.Standings[:10], nil
+			}
+			return cache.Standings, nil
+		}
+	}
+
+	raceData, err := os.ReadFile("data/race.json")
+	if err != nil {
+		return nil, fmt.Errorf("reading race cache: %w", err)
+	}
+
+	session_key := getSessionKey(raceData, "prev")
+	if session_key == 0 {
+		return nil, fmt.Errorf("no completed race found in cache (session_key=0)")
+	}
+
 	resp, err := http.Get(
 		fmt.Sprintf(
-			"https://api.openf1.org/v1/championship_drivers?session_key=%s",
+			"https://api.openf1.org/v1/championship_drivers?session_key=%d",
 			session_key,
 		),
 	)
 	if err != nil {
-		log.Printf("Error getting driver standings at %v: %v", time.Now(), err)
+		return nil, fmt.Errorf("requesting driver standings: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("OpenF1 returned status: %s", resp.Status)
+	}
+
+	var standings []driverStandings
+	if err := json.NewDecoder(resp.Body).Decode(&standings); err != nil {
+		return nil, fmt.Errorf("decoding driver standings: %w", err)
+	}
+
+	if err := os.MkdirAll("data", 0755); err != nil {
+		return nil, err
+	}
+
+	cache := driverStandingCache{
+		UpdatedAt: time.Now().UTC(),
+		Standings: standings,
+	}
+
+	data, err = json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+
+	if err := os.WriteFile("data/standings.json", data, 0644); err != nil {
+		return nil, err
+	}
+
+	// return top 10
+	if len(standings) > 10 {
+		standings = standings[:10]
+	}
+
+	return standings, nil
+
 }
 
 func main() {
@@ -245,6 +349,54 @@ func main() {
 			return
 		}
 		bot.SendMessage(m.ChannelID, strings.Join(args, " "))
+	})
+
+	bot.AddCommand("embed", func(m *gofluxer.Message, args []string) {
+		title := "Embed demo"
+		if len(args) > 0 {
+			title = strings.Join(args, " ")
+		}
+		SendEmbed(bot, m.ChannelID, Embed{
+			Title:       title,
+			Description: "Sent with the typed Embed helper.",
+			Color:       0x5865F2,
+			Fields: []EmbedField{
+				{Name: "User", Value: m.Author.Username, Inline: true},
+				{Name: "Channel", Value: m.ChannelID, Inline: true},
+			},
+			Footer: &EmbedFooter{Text: "franz-hermann bot"},
+		})
+	})
+
+	//bot.AddCommand("ds",func(m *gofluxer.))
+	//i doubt the existence of embeds
+	bot.AddCommand("ds", func(m *gofluxer.Message, args []string) {
+		title := "Top 10 Driver Leaderboard"
+		if len(args) > 0 {
+			title = strings.Join(args, " ")
+		}
+
+		standings, err := getDriverStandings()
+		if err != nil {
+			bot.SendMessage(m.ChannelID, "Failed to fetch driver standings: "+err.Error())
+			return
+		}
+
+		fields := make([]EmbedField, 0, len(standings))
+		for _, d := range standings {
+			fields = append(fields, EmbedField{
+				Name:   fmt.Sprintf("#%d", d.DriverNumber),
+				Value:  fmt.Sprintf("%.1f pts (P%d)", d.PointsCurrent, d.PositionCurrent),
+				Inline: true,
+			})
+		}
+
+		SendEmbed(bot, m.ChannelID, Embed{
+			Title:       title,
+			Description: "Driver standings from latest race session",
+			Color:       0x584F99,
+			Fields:      fields,
+		})
 	})
 
 	bot.Run()
