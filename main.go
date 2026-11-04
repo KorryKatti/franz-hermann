@@ -226,6 +226,38 @@ func getSessionKey(data []byte, which string) int {
 	return 0
 }
 
+type driverNumber struct {
+	meeting_key    int    `json:"meeting_key"`
+	session_key    int    `json:"session_key"`
+	driver_number  int    `json:"driver_number"`
+	broadcast_name string `json:"broadcast_name"`
+	full_name      string `json:"full_name"`
+	name_acronym   string `json:"name_acronym"`
+	team_name      string `json:"team_name"`
+	team_colour    string `json:"team_colour"`
+	/*finally someone with u in color*/
+	first_name   string `json:"first_name"`
+	last_name    string `json:"last_name"`
+	headshot_url string `json:"headshot_url"`
+	country_code string `json:"country_code"`
+}
+
+func getDriverName(session_key, driverNumber int) (string, error) {
+	resp, err := http.Get(
+		fmt.Sprintf(
+			"https://api.openf1.org/v1/drivers?driver_number=%d&session_key=%d",
+			driverNumber, session_key,
+		),
+	)
+	if err != nil {
+		return "", fmt.Errorf("couldn't get driver names : %w", err)
+	}
+	defer resp.Body.Close()
+	// i think a yearly update is fine here , but mmmhh , 20 days should be fine
+
+	return "", fmt.Errorf("yeah man its bad , driver name couldn't get")
+}
+
 func getDriverStandings() ([]driverStandings, error) {
 	// so the thing here is it will take session id of last race conducted and give top 10
 	data, err := os.ReadFile("data/standings.json")
