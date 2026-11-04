@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -178,20 +179,15 @@ type driverStandingCache struct {
 	Standings []driverStandings `json:"standings"`
 }
 
-func getSessionKey(data []byte, which string) int {
+func getSessionKey(races []Session, which string) int {
 	// possible thigs in which is prev and curr , if prev return prev session id and if curr return today's session id and if not found default to prev
-	var cache RaceCache
-
-	if err := json.Unmarshal(data, &cache); err != nil {
-		return 0
-	}
 	now := time.Now().UTC()
 	var previous Session
 	var current Session
 	foundPrevious := false
 	foundCurrent := false
 
-	for _, race := range cache.Races {
+	for _, race := range races {
 
 		if race.IsCancelled || race.SessionName != "Race" {
 			continue
@@ -226,36 +222,112 @@ func getSessionKey(data []byte, which string) int {
 	return 0
 }
 
-type driverNumber struct {
-	meeting_key    int    `json:"meeting_key"`
-	session_key    int    `json:"session_key"`
-	driver_number  int    `json:"driver_number"`
-	broadcast_name string `json:"broadcast_name"`
-	full_name      string `json:"full_name"`
-	name_acronym   string `json:"name_acronym"`
-	team_name      string `json:"team_name"`
-	team_colour    string `json:"team_colour"`
-	/*finally someone with u in color*/
-	first_name   string `json:"first_name"`
-	last_name    string `json:"last_name"`
-	headshot_url string `json:"headshot_url"`
-	country_code string `json:"country_code"`
+type driverNumberType struct {
+	MeetingKey    int    `json:"meeting_key"`
+	SessionKey    int    `json:"session_key"`
+	DriverNumber  int    `json:"driver_number"`
+	BroadcastName string `json:"broadcast_name"`
+	FullName      string `json:"full_name"`
+	NameAcronym   string `json:"name_acronym"`
+	TeamName      string `json:"team_name"`
+	TeamColour    string `json:"team_colour"`
+	FirstName     string `json:"first_name"`
+	LastName      string `json:"last_name"`
+	HeadshotURL   string `json:"headshot_url"`
+	CountryCode   string `json:"country_code"`
+	CountryName   string `json:"country_name"`
 }
 
-func getDriverName(session_key, driverNumber int) (string, error) {
+// Exported fields: encoding/json silently skips unexported ones, which would
+// leave the cache empty both when writing and when reading it back.
+type driverNumberCache struct {
+	LastUpdated time.Time          `json:"last_updated"`
+	Drivers     []driverNumberType `json:"drivers"`
+}
+
+func getDriverName(driverNumber int) (driverNumberType, error) {
+	data, err := os.ReadFile("data/drivers.json")
+
+	if err == nil {
+		var cache driverNumberCache
+		if json.Unmarshal(data, &cache) == nil &&
+			!cache.LastUpdated.IsZero() &&
+			time.Since(cache.LastUpdated) < 480*time.Hour && len(cache.Drivers) > 0 {
+			for _, d := range cache.Drivers {
+				if d.DriverNumber == driverNumber {
+					return d, nil
+				}
+			}
+		}
+	}
+
+	races, err := getRaces()
+	if err != nil {
+		return driverNumberType{}, fmt.Errorf("loading races: %w", err)
+	}
+
+	session_key := getSessionKey(races, "prev")
+	if session_key == 0 {
+		return driverNumberType{}, fmt.Errorf("no completed race found (session_key=0)")
+	}
+
 	resp, err := http.Get(
 		fmt.Sprintf(
-			"https://api.openf1.org/v1/drivers?driver_number=%d&session_key=%d",
-			driverNumber, session_key,
+			"https://api.openf1.org/v1/drivers?session_key=%d",
+			session_key,
 		),
 	)
 	if err != nil {
-		return "", fmt.Errorf("couldn't get driver names : %w", err)
+		return driverNumberType{}, fmt.Errorf("couldn't get driver names: %w", err)
 	}
 	defer resp.Body.Close()
-	// i think a yearly update is fine here , but mmmhh , 20 days should be fine
 
-	return "", fmt.Errorf("yeah man its bad , driver name couldn't get")
+	if resp.StatusCode != http.StatusOK {
+		return driverNumberType{}, fmt.Errorf("OpenF1 returned status: %s", resp.Status)
+	}
+
+	var driverNumbers []driverNumberType
+	if err := json.NewDecoder(resp.Body).Decode(&driverNumbers); err != nil {
+		return driverNumberType{}, fmt.Errorf("decoding driver names: %w", err)
+	}
+
+	if err := os.MkdirAll("data", 0755); err != nil {
+		return driverNumberType{}, err
+	}
+
+	var cache driverNumberCache
+	cache = driverNumberCache{
+		LastUpdated: time.Now().UTC(),
+		Drivers:     driverNumbers,
+	}
+
+	cacheData, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return driverNumberType{}, err
+	}
+	if err := os.WriteFile("data/drivers.json", cacheData, 0644); err != nil {
+		return driverNumberType{}, err
+	}
+
+	for _, d := range driverNumbers {
+		if d.DriverNumber == driverNumber {
+			return d, nil
+		}
+	}
+
+	return driverNumberType{}, fmt.Errorf("driver %d not found", driverNumber)
+}
+
+// driverCountry prefers the full country name when the API sends one and falls
+// back to the code, since country_code is null for some drivers.
+func driverCountry(d driverNumberType) string {
+	if d.CountryName != "" {
+		return d.CountryName
+	}
+	if d.CountryCode != "" {
+		return d.CountryCode
+	}
+	return "Unknown"
 }
 
 func getDriverStandings() ([]driverStandings, error) {
@@ -274,14 +346,14 @@ func getDriverStandings() ([]driverStandings, error) {
 		}
 	}
 
-	raceData, err := os.ReadFile("data/race.json")
+	races, err := getRaces()
 	if err != nil {
-		return nil, fmt.Errorf("reading race cache: %w", err)
+		return nil, fmt.Errorf("loading races: %w", err)
 	}
 
-	session_key := getSessionKey(raceData, "prev")
+	session_key := getSessionKey(races, "prev")
 	if session_key == 0 {
-		return nil, fmt.Errorf("no completed race found in cache (session_key=0)")
+		return nil, fmt.Errorf("no completed race found (session_key=0)")
 	}
 
 	resp, err := http.Get(
@@ -416,8 +488,13 @@ func main() {
 
 		fields := make([]EmbedField, 0, len(standings))
 		for _, d := range standings {
+			name := fmt.Sprintf("#%d", d.DriverNumber)
+			if driver, err := getDriverName(d.DriverNumber); err == nil && driver.NameAcronym != "" {
+				name = fmt.Sprintf("#%d %s", d.DriverNumber, driver.NameAcronym)
+			}
+
 			fields = append(fields, EmbedField{
-				Name:   fmt.Sprintf("#%d", d.DriverNumber),
+				Name:   name,
 				Value:  fmt.Sprintf("%.1f pts (P%d)", d.PointsCurrent, d.PositionCurrent),
 				Inline: true,
 			})
@@ -429,6 +506,58 @@ func main() {
 			Color:       0x584F99,
 			Fields:      fields,
 		})
+	})
+
+	bot.AddCommand("who", func(m *gofluxer.Message, args []string) {
+		// to return driver name and embed info when number of driver is passed , session_key will be assumed to be current by default
+		if len(args) == 0 {
+			bot.SendMessage(m.ChannelID, "You didn't specify a driver number.")
+			return
+		}
+		number, err := strconv.Atoi(args[0])
+		if err != nil {
+			bot.SendMessage(m.ChannelID, fmt.Sprintf("%q is not a driver number.", args[0]))
+			return
+		}
+
+		driver, err := getDriverName(number)
+		if err != nil {
+			bot.SendMessage(m.ChannelID, "Error fetching driver: "+err.Error())
+			return
+		}
+
+		name := driver.FullName
+		if name == "" {
+			name = driver.BroadcastName
+		}
+		if name == "" {
+			name = driver.NameAcronym
+		}
+
+		team := driver.TeamName
+		if team == "" {
+			team = "Unknown"
+		}
+
+		fields := make([]EmbedField, 0, 1)
+		fields = append(fields, EmbedField{
+			Name:   fmt.Sprintf("#%d %s", driver.DriverNumber, name),
+			Value:  fmt.Sprintf("Team %s | Country %s", team, driverCountry(driver)),
+			Inline: true,
+		})
+
+		// team_colour comes from OpenF1 as a bare hex string such as "FF8000".
+		colInt, err := strconv.ParseInt(strings.TrimPrefix(driver.TeamColour, "#"), 16, 32)
+		if err != nil {
+			colInt = 0
+		}
+		SendEmbed(bot, m.ChannelID, Embed{
+			Title:     "Your driver is " + name,
+			Color:     int(colInt),
+			Thumbnail: &EmbedImage{URL: driver.HeadshotURL},
+			Fields:    fields,
+		})
+
 	})
 
 	bot.Run()
