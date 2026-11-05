@@ -14,8 +14,12 @@ services:
       TZ: UTC
 
     # Persist the JSON cache (data/*.json) across rebuilds/restarts.
+    # Use a NAMED volume, not ./data bind mount: the image creates
+    # /app/data owned by app (uid 10001). A ./data bind mount is owned
+    # by the host user (uid 1000/ubuntu, or root), so the container
+    # gets "open data/race.json: permission denied" on WriteFile.
     volumes:
-      - ./data:/app/data
+      - franz-data:/app/data
 
     # No ports: Discord bot uses an outbound websocket only.
 
@@ -24,3 +28,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  franz-data:
