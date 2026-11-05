@@ -9,16 +9,16 @@ import (
 // Embed is a typed helper for building Discord-style embeds.
 // Convert with ToMap() and pass to bot.SendEmbed / EditMessage.
 type Embed struct {
-	Title       string         `json:"title,omitempty"`
-	Description string         `json:"description,omitempty"`
-	URL         string         `json:"url,omitempty"`
-	Color       int            `json:"color,omitempty"`
-	Timestamp   string         `json:"timestamp,omitempty"`
-	Footer      *EmbedFooter   `json:"footer,omitempty"`
-	Image       *EmbedImage    `json:"image,omitempty"`
-	Thumbnail   *EmbedImage    `json:"thumbnail,omitempty"`
-	Author      *EmbedAuthor   `json:"author,omitempty"`
-	Fields      []EmbedField   `json:"fields,omitempty"`
+	Title       string       `json:"title,omitempty"`
+	Description string       `json:"description,omitempty"`
+	URL         string       `json:"url,omitempty"`
+	Color       int          `json:"color,omitempty"`
+	Timestamp   string       `json:"timestamp,omitempty"`
+	Footer      *EmbedFooter `json:"footer,omitempty"`
+	Image       *EmbedImage  `json:"image,omitempty"`
+	Thumbnail   *EmbedImage  `json:"thumbnail,omitempty"`
+	Author      *EmbedAuthor `json:"author,omitempty"`
+	Fields      []EmbedField `json:"fields,omitempty"`
 }
 
 type EmbedFooter struct {
@@ -51,5 +51,14 @@ func (e Embed) ToMap() map[string]interface{} {
 
 // SendEmbed sends a typed Embed.
 func SendEmbed(bot *gofluxer.Bot, channelID string, e Embed) {
+	// gofluxer swallows send errors, so an invalid embed fails silently.
+	// Drop empty image/thumbnail URLs — "thumbnail":{"url":""} makes
+	// the API reject the whole embed (this is what silenced `who 50`).
+	if e.Thumbnail != nil && e.Thumbnail.URL == "" {
+		e.Thumbnail = nil
+	}
+	if e.Image != nil && e.Image.URL == "" {
+		e.Image = nil
+	}
 	bot.SendEmbed(channelID, e.ToMap())
 }

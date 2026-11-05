@@ -1,0 +1,14 @@
+# Secrets — never bake into the image
+.env
+
+# VCS / CI
+.git
+.github
+
+# Local build artifacts
+franz-hermann
+tmp/
+
+# Runtime cache — refetched at runtime, mounted as a volume in compose
+data/
+fluxer/

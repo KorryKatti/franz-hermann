@@ -1,0 +1,26 @@
+services:
+  franz-hermann:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: franz-hermann:latest
+    container_name: franz-hermann
+    restart: unless-stopped
+
+    # BOT_TOKEN comes from .env — never commit it or bake it into the image.
+    env_file:
+      - .env
+    environment:
+      TZ: UTC
+
+    # Persist the JSON cache (data/*.json) across rebuilds/restarts.
+    volumes:
+      - ./data:/app/data
+
+    # No ports: Discord bot uses an outbound websocket only.
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
