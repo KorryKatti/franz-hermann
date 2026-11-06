@@ -19,6 +19,8 @@ import (
 	"time"
 )
 
+const year = 2026
+
 type Session struct {
 	SessionKey       int       `json:"session_key"`
 	SessionType      string    `json:"session_type"`
@@ -314,7 +316,13 @@ func getRaces() ([]Session, error) {
 		}
 	}
 
-	resp, err := httpClient.Get("https://api.openf1.org/v1/sessions?year=2026&session_type=Race")
+	url := fmt.Sprintf(
+		"https://api.openf1.org/v1/sessions?year=%d&session_type=Race",
+		year,
+	)
+
+	resp, err := httpClient.Get(url)
+
 	if err != nil {
 		return nil, err
 	}
@@ -823,6 +831,127 @@ func mapSessionResults(results []sessionResult) []driverStandings {
 	return standings
 }
 
+type allSession struct {
+	SessionKey       int       `json:"session_key"`
+	SessionType      string    `json:"session_type"`
+	SessionName      string    `json:"session_name"`
+	DateStart        time.Time `json:"date_start"`
+	DateEnd          time.Time `json:"date_end"`
+	MeetingKey       int       `json:"meeting_key"`
+	CircuitKey       int       `json:"circuit_key"`
+	CircuitShortName string    `json:"circuit_short_name"`
+	CountryKey       int       `json:"country_key"`
+	CountryCode      string    `json:"country_code"`
+	CountryName      string    `json:"country_name"`
+	Location         string    `json:"location"`
+	GMTOffset        string    `json:"gmt_offset"` // should this have been time.Time too ?
+	Year             int       `json:"year"`
+	IsCancelled      bool      `json:"is_cancelled"`
+}
+
+type allSessionCache struct {
+	UpdatedAt   time.Time    `json:"updated_at"`
+	AllSessions []allSession `json:"all_sessions"`
+}
+
+func findNextSession(sessions []allSession) *allSession {
+	now := time.Now().UTC()
+	var next *allSession
+
+	for i := range sessions {
+		session := &sessions[i]
+
+		if session.IsCancelled {
+			continue
+		}
+
+		if session.DateEnd.Before(now) {
+			continue
+		}
+
+		if next == nil || session.DateStart.Before(next.DateStart) {
+			next = session
+		}
+	}
+
+	return next
+}
+
+func getNextSession() (*allSession, error) {
+	// i am also thinking , cant i get the last modified data by some os params anyways ?
+	// that would meke json parsing for me easier , not having to store the time
+	// will think
+	// made a constant year at top
+	data, err := os.ReadFile("data/sessions.json")
+
+	if err == nil {
+		var cache allSessionCache
+
+		if json.Unmarshal(data, &cache) == nil &&
+			!cache.UpdatedAt.IsZero() &&
+			time.Since(cache.UpdatedAt) < 120*time.Hour {
+
+			fmt.Println("Using cached sessions")
+
+			next := findNextSession(cache.AllSessions)
+
+			if next != nil {
+				fmt.Println("Next session:", next.SessionName)
+				fmt.Println("Starts at:", next.DateStart)
+			} else {
+				fmt.Println("No upcoming sessions found")
+			}
+
+			return next, nil
+
+		}
+	}
+
+	url := fmt.Sprintf(
+		"https://api.openf1.org/v1/sessions?year=%d",
+		year,
+	)
+
+	resp, err := httpClient.Get(url)
+
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("OpenF1 returned status: %s", resp.Status)
+	}
+
+	var all_sessions []allSession
+	if err := json.NewDecoder(resp.Body).Decode(&all_sessions); err != nil {
+		return nil, fmt.Errorf("decoding driver names: %w", err)
+	}
+
+	if err := os.MkdirAll("data", 0755); err != nil {
+		return nil, err
+	}
+
+	var cache allSessionCache
+	cache = allSessionCache{
+		UpdatedAt:   time.Now().UTC(),
+		AllSessions: all_sessions,
+	}
+
+	cacheData, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+
+	if err := os.WriteFile("data/sessions.json", cacheData, 0644); err != nil {
+		return nil, err
+	}
+
+	next := findNextSession(all_sessions)
+
+	return next, nil
+
+}
+
 func main() {
 	godotenv.Load()
 
@@ -942,6 +1071,7 @@ func main() {
 				{Name: "ds [title]", Value: "Top 10 driver standings from the latest race session", Inline: false},
 				{Name: "who <driver number>", Value: "Driver name, team and country by car number (e.g. `>who 1`)", Inline: false},
 				{Name: "last [title]", Value: "Top 10 results from the last race", Inline: false},
+				{Name: "next [title]", Value: "Next session with location, circuit, country and countdown", Inline: false},
 				{Name: "help [title]", Value: "Shows this help message", Inline: false},
 			},
 			Footer: &EmbedFooter{Text: "franz-hermann bot"},
@@ -1113,6 +1243,76 @@ func main() {
 			URL:         siteURL,
 			Description: description,
 			Color:       color,
+			Fields:      fields,
+			Footer:      &EmbedFooter{Text: "franz-hermann bot"},
+		})
+	}))
+
+	bot.AddCommand("next", asyncHandler(bot, func(m *gofluxer.Message, args []string) {
+		title := "Next session"
+		if len(args) > 0 {
+			title = strings.Join(args, " ")
+		}
+
+		next, err := getNextSession()
+		if err != nil {
+			log.Printf("getNextSession: %v", err)
+			return
+		}
+
+		if next == nil {
+			SendEmbed(bot, m.ChannelID, Embed{
+				Title:       title,
+				Description: "No upcoming sessions found.",
+				Color:       0x5865F2,
+			})
+			return
+		}
+
+		timestamp := next.DateStart.Unix()
+
+		// next.Location / CircuitShortName / CountryName / SessionType are
+		// already in the OpenF1 payload (see allSession) — the old embed
+		// just never printed them, only SessionName + start time.
+		sessionLabel := next.SessionName
+		if next.SessionType != "" {
+			sessionLabel = fmt.Sprintf("%s (%s)", next.SessionName, next.SessionType)
+		}
+		if sessionLabel == "" {
+			sessionLabel = "Next session"
+		}
+
+		description := fmt.Sprintf(
+			"**%s**\nStarts: <t:%d:F>\nCountdown: <t:%d:R>",
+			sessionLabel,
+			timestamp,
+			timestamp,
+		)
+
+		// Fall back so the embed never shows a blank field when OpenF1
+		// omits one of these for a session.
+		orUnknown := func(s string) string {
+			if s == "" {
+				return "—"
+			}
+			return s
+		}
+		country := orUnknown(next.CountryName)
+		if next.CountryCode != "" {
+			country = fmt.Sprintf("%s (%s)", country, next.CountryCode)
+		}
+
+		fields := []EmbedField{
+			{Name: "Location", Value: orUnknown(next.Location), Inline: true},
+			{Name: "Circuit", Value: orUnknown(next.CircuitShortName), Inline: true},
+			{Name: "Country", Value: country, Inline: true},
+		}
+
+		SendEmbed(bot, m.ChannelID, Embed{
+			Title:       title,
+			URL:         siteURL,
+			Description: description,
+			Color:       0x5865F2,
 			Fields:      fields,
 			Footer:      &EmbedFooter{Text: "franz-hermann bot"},
 		})
