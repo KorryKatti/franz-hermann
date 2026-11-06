@@ -6,6 +6,10 @@ and driver lookups by car number.
 
 Built with Go + [gofluxer](https://github.com/go-fluxer/gofluxer).
 
+## Invite
+
+[Invite Franz Hermann to your server](https://fluxer.com/oauth2/authorize?client_id=1566837767571247107&scope=bot&permissions=274878171200)
+
 ## Commands
 
 All commands use the `>` prefix (e.g. `>who 1`).

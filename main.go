@@ -76,6 +76,9 @@ var startTime = time.Now()
 // every 2 hours, everybody else gets the cached latency.
 const openF1PingTTL = 2 * time.Hour
 
+// siteURL is the bot's page, linked from every embed's title.
+const siteURL = "https://korrykatti.github.io/franz-hermann"
+
 type pingCache struct {
 	mu        sync.Mutex
 	latency   time.Duration
@@ -901,6 +904,7 @@ func main() {
 
 		SendEmbed(bot, m.ChannelID, Embed{
 			Title:       "Pong!",
+			URL:         siteURL,
 			Description: "Live latency and resource usage",
 			Color:       0x5865F2,
 			Fields: []EmbedField{
@@ -929,6 +933,7 @@ func main() {
 		}
 		SendEmbed(bot, m.ChannelID, Embed{
 			Title:       title,
+			URL:         siteURL,
 			Description: "Commands for the franz-hermann bot. All commands start with " + PREFIX,
 			Color:       0x5865F2,
 			Fields: []EmbedField{
@@ -977,6 +982,7 @@ func main() {
 
 		SendEmbed(bot, m.ChannelID, Embed{
 			Title:       title,
+			URL:         siteURL,
 			Description: "Driver standings from latest race session",
 			Color:       0x584F99,
 			Fields:      fields,
@@ -1036,6 +1042,7 @@ func main() {
 		}
 		embed := Embed{
 			Title:  "Your driver is " + name,
+			URL:    siteURL,
 			Color:  int(colInt),
 			Fields: fields,
 		}
@@ -1103,6 +1110,7 @@ func main() {
 
 		SendEmbed(bot, m.ChannelID, Embed{
 			Title:       title,
+			URL:         siteURL,
 			Description: description,
 			Color:       color,
 			Fields:      fields,
