@@ -17,7 +17,6 @@ All commands use the `>` prefix (e.g. `>who 1`).
 | Command | What it does |
 | --- | --- |
 | `>ping` | Live latency to Fluxer + OpenF1, plus CPU/memory usage. OpenF1 is probed at most once per 2 hours; pings in between report the cached value |
-| `>say <text>` | Repeats your text back |
 | `>ds [title]` | Top 10 driver standings from the latest race session |
 | `>who <driver number>` | Driver name, team and country by car number (e.g. `>who 1`). Drivers without a headshot (e.g. reserve driver `#50`) just get no photo |
 | `>last [title]` | Top 10 results from the last race |

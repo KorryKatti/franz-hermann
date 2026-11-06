@@ -1047,14 +1047,6 @@ func main() {
 		})
 	}))
 
-	bot.AddCommand("say", asyncHandler(bot, func(m *gofluxer.Message, args []string) {
-		if len(args) == 0 {
-			bot.SendMessage(m.ChannelID, "What do you want me to say?")
-			return
-		}
-		bot.SendMessage(m.ChannelID, strings.Join(args, " "))
-	}))
-
 	bot.AddCommand("help", asyncHandler(bot, func(m *gofluxer.Message, args []string) {
 		title := "Help command"
 		if len(args) > 0 {
@@ -1067,7 +1059,6 @@ func main() {
 			Color:       0x5865F2,
 			Fields: []EmbedField{
 				{Name: "ping", Value: "Live latency to Fluxer + OpenF1 (OpenF1 probed at most once per 2h), plus CPU/memory usage", Inline: false},
-				{Name: "say <text>", Value: "Repeats your text back", Inline: false},
 				{Name: "ds [title]", Value: "Top 10 driver standings from the latest race session", Inline: false},
 				{Name: "who <driver number>", Value: "Driver name, team and country by car number (e.g. `>who 1`)", Inline: false},
 				{Name: "last [title]", Value: "Top 10 results from the last race", Inline: false},
