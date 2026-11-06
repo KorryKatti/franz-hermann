@@ -291,30 +291,43 @@ func fmtMs(d time.Duration) string {
 const (
 	PREFIX = ">"
 
-	// Race-day banner: shown from 1 hour before lights out until 12 hours
-	// after the start (race + post-race).
 	raceDayLead  = time.Hour
-	raceDayGrace = 12 * time.Hour
+	raceDayGrace = time.Hour
 )
 
-// raceUnderway is true while we are inside the race-day window — i.e. from
-// 1h before lights out until 12h after the start. Updated by getStatus on
-// every presence refresh, read by anything that needs to know whether a race
-// is on. atomic because the ready handler and the refresh ticker both call
-// getStatus from different goroutines.
+// raceUnderway gates the short cache ttl while a race/sprint is on
 var raceUnderway atomic.Bool
+var lastRaceFetch time.Time
+var statusIndex int
+var rotatingStatuses []string
+var lastStatusRotation time.Time
 
 func getRaces() ([]Session, error) {
+	raceTTL := 72 * time.Hour
+	if raceUnderway.Load() {
+		raceTTL = 35 * time.Minute
+	}
+
+	var stale []Session
+
 	data, err := os.ReadFile("data/race.json")
 
 	if err == nil {
 		var cache RaceCache
 		if json.Unmarshal(data, &cache) == nil &&
-			!cache.UpdatedAt.IsZero() &&
-			time.Since(cache.UpdatedAt) < 72*time.Hour {
-			return cache.Races, nil
+			!cache.UpdatedAt.IsZero() {
+			stale = cache.Races
+			if time.Since(cache.UpdatedAt) < raceTTL {
+				return cache.Races, nil
+			}
 		}
 	}
+
+	// stale cache on api failure so we dont hammer a 429
+	if len(stale) > 0 && !lastRaceFetch.IsZero() && time.Since(lastRaceFetch) < raceTTL {
+		return stale, nil
+	}
+	lastRaceFetch = time.Now()
 
 	url := fmt.Sprintf(
 		"https://api.openf1.org/v1/sessions?year=%d&session_type=Race",
@@ -324,15 +337,24 @@ func getRaces() ([]Session, error) {
 	resp, err := httpClient.Get(url)
 
 	if err != nil {
+		if len(stale) > 0 {
+			return stale, nil
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		if len(stale) > 0 {
+			return stale, nil
+		}
 		return nil, fmt.Errorf("OpenF1 returned status: %s", resp.Status)
 	}
 
 	var races []Session
 	if err := json.NewDecoder(resp.Body).Decode(&races); err != nil {
+		if len(stale) > 0 {
+			return stale, nil
+		}
 		return nil, err
 	}
 
@@ -369,12 +391,15 @@ func getStatus() string {
 	foundNext := false
 
 	for i := range races {
+		if races[i].IsCancelled {
+			continue
+		}
+
 		start := races[i].DateStart
 
 		remaining := start.Sub(now)
 
-		// Inside the race-day window: from 1h before the start up to 12h after.
-		if remaining <= raceDayLead && remaining > -raceDayGrace {
+		if remaining <= raceDayLead && now.Sub(races[i].DateEnd) <= raceDayGrace {
 			if foundRaceDay == false || start.Before(raceDayStart) {
 				raceDay = races[i]
 				raceDayStart = start
@@ -401,27 +426,72 @@ func getStatus() string {
 		return fmt.Sprintf("🏁 RACE DAY at %s", raceDay.Location)
 	}
 
-	if !foundNext {
-		return "🏁 No upcoming races"
-	}
+	countdown := "🏁 No upcoming races"
 
-	remaining := nextDate.Sub(now)
+	if foundNext {
+		remaining := nextDate.Sub(now)
 
-	if remaining < 24*time.Hour {
-		hours := int(remaining.Hours())
-		unit := "hours"
-		if hours == 1 {
-			unit = "hour"
+		if remaining < 24*time.Hour {
+			hours := int(remaining.Hours())
+			unit := "hours"
+			if hours == 1 {
+				unit = "hour"
+			}
+			countdown = fmt.Sprintf(" %s | %d %s until race", next.Location, hours, unit)
+		} else {
+			days := int(remaining / (24 * time.Hour))
+			unit := "days"
+			if days == 1 {
+				unit = "day"
+			}
+			countdown = fmt.Sprintf(" %s | %d %s until race", next.Location, days, unit)
 		}
-		return fmt.Sprintf(" %s | %d %s until race", next.Location, hours, unit)
 	}
 
-	days := int(remaining / (24 * time.Hour))
-	unit := "days"
-	if days == 1 {
-		unit = "day"
+	if len(rotatingStatuses) == 0 || time.Since(lastStatusRotation) >= 15*time.Minute {
+		if len(rotatingStatuses) > 0 {
+			statusIndex = (statusIndex + 1) % len(rotatingStatuses)
+		}
+
+		rotatingStatuses = []string{countdown}
+
+		if nextSession, err := getNextSession(); err == nil && nextSession != nil {
+			place := nextSession.Location
+			if place == "" {
+				place = nextSession.CircuitShortName
+			}
+			if place == "" {
+				rotatingStatuses = append(rotatingStatuses, fmt.Sprintf("Next: %s", nextSession.SessionName))
+			} else {
+				rotatingStatuses = append(rotatingStatuses, fmt.Sprintf("Next: %s · %s", nextSession.SessionName, place))
+			}
+		}
+
+		if standings, err := getDriverStandings(); err == nil && len(standings) > 0 {
+			name := fmt.Sprintf("#%d", standings[0].DriverNumber)
+			if driver, err := getDriverName(standings[0].DriverNumber); err == nil && driver.NameAcronym != "" {
+				name = driver.NameAcronym
+			}
+			rotatingStatuses = append(rotatingStatuses, fmt.Sprintf("Leader: %s · %.1f pts", name, standings[0].PointsCurrent))
+		}
+
+		if standings, err := getLastStandings(); err == nil && len(standings) > 0 {
+			name := fmt.Sprintf("#%d", standings[0].DriverNumber)
+			if driver, err := getDriverName(standings[0].DriverNumber); err == nil && driver.NameAcronym != "" {
+				name = driver.NameAcronym
+			}
+			rotatingStatuses = append(rotatingStatuses, fmt.Sprintf("Last race P1: %s", name))
+		}
+
+		rotatingStatuses = append(rotatingStatuses, ">help for commands")
+
+		if statusIndex >= len(rotatingStatuses) {
+			statusIndex = 0
+		}
+		lastStatusRotation = time.Now()
 	}
-	return fmt.Sprintf(" %s | %d %s until race", next.Location, days, unit)
+
+	return rotatingStatuses[statusIndex]
 }
 
 type driverStandings struct {
@@ -891,16 +961,7 @@ func getNextSession() (*allSession, error) {
 			!cache.UpdatedAt.IsZero() &&
 			time.Since(cache.UpdatedAt) < 120*time.Hour {
 
-			fmt.Println("Using cached sessions")
-
 			next := findNextSession(cache.AllSessions)
-
-			if next != nil {
-				fmt.Println("Next session:", next.SessionName)
-				fmt.Println("Starts at:", next.DateStart)
-			} else {
-				fmt.Println("No upcoming sessions found")
-			}
 
 			return next, nil
 
