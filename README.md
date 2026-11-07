@@ -26,7 +26,7 @@ All commands use the `>` prefix (e.g. `>who 1`).
 | `>help [title]` | Shows the help message |
 
 The bot also sets its presence to the next race countdown, or `🏁 RACE DAY at …`
-from 1 hour before lights out until 12 hours after the start, refreshed every
+from 1 hour before lights out until 1 hour after the session ends, refreshed every
 5 minutes.
 
 ## Configuration
