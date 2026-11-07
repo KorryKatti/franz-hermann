@@ -20,6 +20,9 @@ All commands use the `>` prefix (e.g. `>who 1`).
 | `>ds [title]` | Top 10 driver standings from the latest race session |
 | `>who <driver number>` | Driver name, team and country by car number (e.g. `>who 1`). Drivers without a headshot (e.g. reserve driver `#50`) just get no photo |
 | `>last [title]` | Top 10 results from the last race |
+| `>next [title]` | Next session with location, circuit, country and countdown |
+| `>follow` | Subscribe this channel to race/sprint reminders 30 minutes before start |
+| `>unfollow` | Unsubscribe this server from race/sprint reminders |
 | `>help [title]` | Shows the help message |
 
 The bot also sets its presence to the next race countdown, or `🏁 RACE DAY at …`

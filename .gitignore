@@ -3,3 +3,4 @@ data/
 fluxer/
 franz-hermann
 tmp/
+*.db

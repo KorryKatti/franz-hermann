@@ -1,11 +1,13 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/go-fluxer/gofluxer"
 	"github.com/joho/godotenv"
+	_ "github.com/mattn/go-sqlite3"
 	"io"
 	"log"
 	"net/http"
@@ -18,6 +20,8 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+var DB *sql.DB
 
 const year = 2026
 
@@ -1013,8 +1017,264 @@ func getNextSession() (*allSession, error) {
 
 }
 
+func initDB() {
+	var err error
+	// DB lives in data/, not the workdir: in Docker the process runs as
+	// USER app, which can only write /app/data (root owns /app), and
+	// compose persists /app/data via the franz-data volume — so this
+	// both starts in the container and keeps subscriptions across rebuilds.
+	if err := os.MkdirAll("data", 0755); err != nil {
+		log.Fatal("Failed to create data dir for database:", err)
+	}
+	// i find it very hard to get docs for mttn sqlite3 for some reason
+	DB, err = sql.Open("sqlite3", "./data/f1bot.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+	query := `
+	CREATE TABLE IF NOT EXISTS subscriptions (
+		server_id TEXT PRIMARY KEY,
+		channel_id TEXT NOT NULL,
+		invoker_user_id TEXT NOT NULL,
+		last_session_id TEXT,
+		sent BOOLEAN DEFAULT FALSE,
+		last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	`
+	_, err = DB.Exec(query)
+	if err != nil {
+		log.Fatal("Faled to create subscription table:", err)
+	}
+	log.Println("database initzlised sccuesfuly")
+}
+
+func addSubscription(serverID, channelID, userID string) error {
+	query := `
+	INSERT INTO subscriptions (
+		server_id,
+		channel_id,
+		invoker_user_id
+	)
+	VALUES (?,?,?)
+	ON CONFLICT (server_id)
+	DO UPDATE SET
+	channel_id = excluded.channel_id,
+	invoker_user_id = excluded.invoker_user_id;
+	`
+	_, err := DB.Exec(query, serverID, channelID, userID)
+	return err
+}
+
+type Subscription struct {
+	ServerID      string
+	ChannelID     string
+	InvokerUserID string
+	LastSessionID string
+	Sent          bool
+}
+
+func getSubscriptions() ([]Subscription, error) {
+	// COALESCE: fresh rows have NULL last_session_id, and scanning NULL
+	// into a string/bool fails, which would break every notification check.
+	rows, err := DB.Query(`
+	SELECT
+	server_id,
+	channel_id,
+	invoker_user_id,
+	COALESCE(last_session_id, ''),
+	COALESCE(sent, 0)
+	FROM subscriptions
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var subscriptions []Subscription
+	for rows.Next() {
+		var sub Subscription
+		err := rows.Scan(
+			&sub.ServerID,
+			&sub.ChannelID,
+			&sub.InvokerUserID,
+			&sub.LastSessionID,
+			&sub.Sent,
+		)
+		if err != nil {
+			return nil, err
+		}
+		subscriptions = append(subscriptions, sub)
+		// getting a hang of this language
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return subscriptions, nil
+}
+
+func removeSubscription(serverID string) error {
+	_, err := DB.Exec(
+		"DELETE FROM subscriptions WHERE server_id = ?",
+		serverID,
+	)
+
+	return err
+}
+
+func shouldNotify(session Session) bool {
+	if session.IsCancelled {
+		return false
+	}
+
+	if session.SessionName != "Race" &&
+		session.SessionName != "Sprint" {
+		return false
+	}
+
+	now := time.Now()
+	notificationTime := session.DateStart.Add(-30 * time.Minute)
+
+	return !now.Before(notificationTime) &&
+		now.Before(session.DateStart)
+}
+
+func findNextRaceOrSprint(sessions []Session) *Session {
+	now := time.Now()
+
+	var next *Session
+
+	for i := range sessions {
+		s := &sessions[i]
+
+		if s.IsCancelled {
+			continue
+		}
+
+		if s.SessionName != "Race" && s.SessionName != "Sprint" {
+			continue
+		}
+
+		if !s.DateStart.After(now) {
+			continue
+		}
+
+		if next == nil || s.DateStart.Before(next.DateStart) {
+			next = s
+		}
+	}
+
+	return next
+}
+
+func shouldSendNotification(sub Subscription, session Session) bool {
+	if sub.LastSessionID != fmt.Sprint(session.SessionKey) {
+		return true
+	}
+
+	return !sub.Sent
+}
+
+func updateNotification(server_id string, session_id string) error {
+	query := `
+    UPDATE subscriptions
+    SET last_session_id = ?,
+        sent = TRUE,
+        last_updated = CURRENT_TIMESTAMP
+    WHERE server_id = ?
+    `
+
+	_, err := DB.Exec(query, session_id, server_id)
+	return err
+}
+
+func createRaceEmbed(session Session) Embed {
+	// Fall back so the embed never shows a blank field when OpenF1
+	// omits one of these for a session — an empty field value makes
+	// Fluxer reject the whole embed and the message is never sent.
+	orUnknown := func(s string) string {
+		if s == "" {
+			return "—"
+		}
+		return s
+	}
+	place := session.Location
+	if place == "" {
+		place = session.CircuitShortName
+	}
+	timestamp := session.DateStart.Unix()
+	return Embed{
+		Title: fmt.Sprintf("🏎️ %s Starting Soon!", orUnknown(session.SessionName)),
+		URL:   siteURL,
+		Description: fmt.Sprintf(
+			"**%s Grand Prix**\n📍 %s\nStarts: <t:%d:F>\nCountdown: <t:%d:R>",
+			orUnknown(session.CountryName),
+			orUnknown(place),
+			timestamp,
+			timestamp,
+		),
+		Color: 0xE10600,
+		Fields: []EmbedField{
+			{
+				Name:   "Session",
+				Value:  orUnknown(session.SessionName),
+				Inline: true,
+			},
+			{
+				Name:   "Circuit",
+				Value:  orUnknown(session.CircuitShortName),
+				Inline: true,
+			},
+			{
+				Name:   "Starts At",
+				Value:  session.DateStart.Format("02 Jan 2006, 15:04 UTC"),
+				Inline: false,
+			},
+		},
+		Footer: &EmbedFooter{
+			Text: "franz-hermann",
+		},
+	}
+}
+
+func checkNotifications(bot *gofluxer.Bot, sessions []Session) {
+	session := findNextRaceOrSprint(sessions)
+
+	if session == nil {
+		return
+	}
+
+	if !shouldNotify(*session) {
+		return
+	}
+
+	subscriptions, err := getSubscriptions()
+	if err != nil {
+		log.Printf("Failed to get subscriptions: %v", err)
+		return
+	}
+
+	embed := createRaceEmbed(*session)
+
+	for _, sub := range subscriptions {
+		if !shouldSendNotification(sub, *session) {
+			continue
+		}
+
+		SendEmbed(bot, sub.ChannelID, embed)
+
+		err := updateNotification(
+			sub.ServerID,
+			fmt.Sprint(session.SessionKey),
+		)
+
+		if err != nil {
+			log.Printf("Failed to update notification: %v", err)
+		}
+	}
+}
+
 func main() {
 	godotenv.Load()
+	initDB()
 
 	bot := gofluxer.NewBot(os.Getenv("BOT_TOKEN"), PREFIX)
 
@@ -1124,6 +1384,8 @@ func main() {
 				{Name: "who <driver number>", Value: "Driver name, team and country by car number (e.g. `>who 1`)", Inline: false},
 				{Name: "last [title]", Value: "Top 10 results from the last race", Inline: false},
 				{Name: "next [title]", Value: "Next session with location, circuit, country and countdown", Inline: false},
+				{Name: "follow", Value: "Subscribe this channel to race/sprint reminders 30 minutes before start", Inline: false},
+				{Name: "unfollow", Value: "Unsubscribe this server from race/sprint reminders", Inline: false},
 				{Name: "help [title]", Value: "Shows this help message", Inline: false},
 			},
 			Footer: &EmbedFooter{Text: "franz-hermann bot"},
@@ -1369,6 +1631,68 @@ func main() {
 			Footer:      &EmbedFooter{Text: "franz-hermann bot"},
 		})
 	}))
+
+	bot.AddCommand("follow", asyncHandler(bot, func(m *gofluxer.Message, args []string) {
+		serverID := m.GuildID
+		channelID := m.ChannelID
+		invokerID := m.Author.ID
+
+		err := addSubscription(serverID, channelID, invokerID)
+		if err != nil {
+			log.Printf("Failed to add subscription: %v", err)
+			bot.SendMessage(channelID, "Something went wrong while subscribing!")
+			return
+		}
+
+		msg := fmt.Sprintf(
+			"This channel has been added to subscriptions by <@%s>",
+			invokerID,
+		)
+
+		bot.SendMessage(channelID, msg)
+	}))
+
+	bot.AddCommand("unfollow", asyncHandler(bot, func(m *gofluxer.Message, args []string) {
+		server_id := m.GuildID
+
+		err := removeSubscription(server_id)
+		if err != nil {
+			log.Printf("%v", err)
+			bot.SendMessage(m.ChannelID, "Something went wrong while unsubscribing!")
+			return
+		}
+
+		msg := fmt.Sprintf("This server has been removed from subscriptions by <@%v>", m.Author.ID)
+		bot.SendMessage(m.ChannelID, msg)
+	}))
+
+	// Race reminder sender: check on startup and then every 5 minutes.
+	// getRaces() is cached (72h, or 35m while a race is underway), so
+	// this is mostly a DB read plus a time comparison.
+	go func() {
+		check := func() {
+			// A panic here must not kill the bot (unlike command handlers,
+			// this goroutine has no asyncHandler recover) — log it and
+			// let the next tick try again.
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("panic in race reminder check: %v", r)
+				}
+			}()
+			sessions, err := getRaces()
+			if err != nil {
+				log.Printf("Race reminder check failed: %v", err)
+				return
+			}
+			checkNotifications(bot, sessions)
+		}
+		check()
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			check()
+		}
+	}()
 
 	bot.Run()
 }
