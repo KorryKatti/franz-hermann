@@ -129,7 +129,10 @@ func getOpenF1Ping() (latency time.Duration, err error, checkedAt time.Time, fre
 	}
 	// Tiny real API call (one driver row, ~400 bytes) — a representative
 	// OpenF1 round-trip. session_key 11404 is a finished historical
-	// session, so it stays valid as a probe forever.
+	// session, so it stays a valid probe whenever the API is open.
+	// During a live session OpenF1 401s even historical requests
+	// (paid key or wait it out), so the ping handler reports that
+	// case as "live session, api limited" rather than an error.
 	latency, err = measureLatency("https://api.openf1.org/v1/drivers?driver_number=1&session_key=11404", "")
 	openF1Ping.latency, openF1Ping.err, openF1Ping.checkedAt = latency, err, time.Now()
 	return latency, err, openF1Ping.checkedAt, true
@@ -1322,10 +1325,16 @@ func main() {
 		}
 
 		// OpenF1: probed at most once per 2 hours, cached in between.
+		// During a live session OpenF1 401s every unauthenticated call
+		// (paid key or wait it out), so say that instead of an error.
 		ofLatency, ofErr, ofCheckedAt, ofFresh := getOpenF1Ping()
 		ofVal := fmtMs(ofLatency)
 		if ofErr != nil {
-			ofVal += " (error: " + ofErr.Error() + ")"
+			if strings.Contains(ofErr.Error(), "401") {
+				ofVal += " (live session, api limited)"
+			} else {
+				ofVal += " (error: " + ofErr.Error() + ")"
+			}
 		}
 		if ofFresh {
 			ofVal += " (fresh)"
