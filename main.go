@@ -57,6 +57,8 @@ var httpClient = &http.Client{Timeout: 10 * time.Second}
 // of a raw error (or, worse, silence).
 var errDriverNotFound = errors.New("driver not found")
 
+var commandSem = make(chan struct{}, 16)
+
 // asyncHandler runs a command off the gateway read loop. gofluxer
 // dispatches commands synchronously, so a slow OpenF1 call inside a
 // handler would block all other messages. Also turns a panic into a
@@ -64,6 +66,8 @@ var errDriverNotFound = errors.New("driver not found")
 func asyncHandler(bot *gofluxer.Bot, fn func(m *gofluxer.Message, args []string)) func(m *gofluxer.Message, args []string) {
 	return func(m *gofluxer.Message, args []string) {
 		go func() {
+			commandSem <- struct{}{}
+			defer func() { <-commandSem }()
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("panic in command handler: %v", r)
@@ -156,6 +160,9 @@ func processCPUSeconds() (float64, error) {
 	}
 	f := strings.Fields(string(data)[idx+1:])
 	// utime/stime are fields 14/15 overall => indexes 11/12 here.
+	if len(f) < 13 {
+		return 0, fmt.Errorf("bad /proc/self/stat")
+	}
 	utime, err1 := strconv.ParseFloat(f[11], 64)
 	stime, err2 := strconv.ParseFloat(f[12], 64)
 	if err1 != nil || err2 != nil {
@@ -304,7 +311,22 @@ const (
 
 // raceUnderway gates the short cache ttl while a race/sprint is on
 var raceUnderway atomic.Bool
+
+var lastRaceFetchMu sync.Mutex
 var lastRaceFetch time.Time
+
+var cacheWriteMu sync.Mutex
+
+func writeCacheFile(path string, data []byte) error {
+	cacheWriteMu.Lock()
+	defer cacheWriteMu.Unlock()
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
 var statusIndex int
 var rotatingStatuses []string
 var lastStatusRotation time.Time
@@ -331,10 +353,13 @@ func getRaces() ([]Session, error) {
 	}
 
 	// stale cache on api failure so we dont hammer a 429
+	lastRaceFetchMu.Lock()
 	if len(stale) > 0 && !lastRaceFetch.IsZero() && time.Since(lastRaceFetch) < raceTTL {
+		lastRaceFetchMu.Unlock()
 		return stale, nil
 	}
 	lastRaceFetch = time.Now()
+	lastRaceFetchMu.Unlock()
 
 	url := fmt.Sprintf(
 		"https://api.openf1.org/v1/sessions?year=%d&session_type=Race",
@@ -373,7 +398,7 @@ func getRaces() ([]Session, error) {
 	}
 
 	data, _ = json.MarshalIndent(cache, "", "  ")
-	if err := os.WriteFile("data/race.json", data, 0644); err != nil {
+	if err := writeCacheFile("data/race.json", data); err != nil {
 		return nil, err
 	}
 
@@ -583,32 +608,49 @@ type driverNumberCache struct {
 }
 
 func getDriverName(driverNumber int) (driverNumberType, error) {
+	var stale []driverNumberType
+	findStale := func() (driverNumberType, bool) {
+		for _, d := range stale {
+			if d.DriverNumber == driverNumber {
+				return d, true
+			}
+		}
+		return driverNumberType{}, false
+	}
+
 	data, err := os.ReadFile("data/drivers.json")
 
 	if err == nil {
 		var cache driverNumberCache
-		if json.Unmarshal(data, &cache) == nil &&
-			!cache.LastUpdated.IsZero() &&
-			time.Since(cache.LastUpdated) < 480*time.Hour && len(cache.Drivers) > 0 {
-			for _, d := range cache.Drivers {
-				if d.DriverNumber == driverNumber {
-					return d, nil
+		if json.Unmarshal(data, &cache) == nil && len(cache.Drivers) > 0 {
+			stale = cache.Drivers
+			if !cache.LastUpdated.IsZero() && time.Since(cache.LastUpdated) < 480*time.Hour {
+				for _, d := range cache.Drivers {
+					if d.DriverNumber == driverNumber {
+						return d, nil
+					}
 				}
+				// A fresh cache is authoritative: the driver isn't in this
+				// race's driver list, so say so now instead of refetching
+				// the same list from the API only to miss again.
+				return driverNumberType{}, fmt.Errorf("%w: #%d", errDriverNotFound, driverNumber)
 			}
-			// A fresh cache is authoritative: the driver isn't in this
-			// race's driver list, so say so now instead of refetching
-			// the same list from the API only to miss again.
-			return driverNumberType{}, fmt.Errorf("%w: #%d", errDriverNotFound, driverNumber)
 		}
 	}
 
 	races, err := getRaces()
 	if err != nil {
+		if d, ok := findStale(); ok {
+			return d, nil
+		}
 		return driverNumberType{}, fmt.Errorf("loading races: %w", err)
 	}
 
 	session_key := getSessionKey(races, "prev")
 	if session_key == 0 {
+		if d, ok := findStale(); ok {
+			return d, nil
+		}
 		return driverNumberType{}, fmt.Errorf("no completed race found (session_key=0)")
 	}
 
@@ -619,16 +661,25 @@ func getDriverName(driverNumber int) (driverNumberType, error) {
 		),
 	)
 	if err != nil {
+		if d, ok := findStale(); ok {
+			return d, nil
+		}
 		return driverNumberType{}, fmt.Errorf("couldn't get driver names: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		if d, ok := findStale(); ok {
+			return d, nil
+		}
 		return driverNumberType{}, fmt.Errorf("OpenF1 returned status: %s", resp.Status)
 	}
 
 	var driverNumbers []driverNumberType
 	if err := json.NewDecoder(resp.Body).Decode(&driverNumbers); err != nil {
+		if d, ok := findStale(); ok {
+			return d, nil
+		}
 		return driverNumberType{}, fmt.Errorf("decoding driver names: %w", err)
 	}
 
@@ -646,7 +697,7 @@ func getDriverName(driverNumber int) (driverNumberType, error) {
 	if err != nil {
 		return driverNumberType{}, err
 	}
-	if err := os.WriteFile("data/drivers.json", cacheData, 0644); err != nil {
+	if err := writeCacheFile("data/drivers.json", cacheData); err != nil {
 		return driverNumberType{}, err
 	}
 
@@ -673,27 +724,42 @@ func driverCountry(d driverNumberType) string {
 
 func getDriverStandings() ([]driverStandings, error) {
 	// so the thing here is it will take session id of last race conducted and give top 10
+	var stale []driverStandings
 	data, err := os.ReadFile("data/standings.json")
 
 	if err == nil {
 		var cache driverStandingCache
-		if json.Unmarshal(data, &cache) == nil &&
-			!cache.UpdatedAt.IsZero() &&
-			time.Since(cache.UpdatedAt) < 72*time.Hour {
-			if len(cache.Standings) > 10 {
-				return cache.Standings[:10], nil
+		if json.Unmarshal(data, &cache) == nil && len(cache.Standings) > 0 {
+			stale = cache.Standings
+			if !cache.UpdatedAt.IsZero() && time.Since(cache.UpdatedAt) < 72*time.Hour {
+				if len(cache.Standings) > 10 {
+					return cache.Standings[:10], nil
+				}
+				return cache.Standings, nil
 			}
-			return cache.Standings, nil
 		}
+	}
+
+	staleTop10 := func() []driverStandings {
+		if len(stale) > 10 {
+			return stale[:10]
+		}
+		return stale
 	}
 
 	races, err := getRaces()
 	if err != nil {
+		if len(stale) > 0 {
+			return staleTop10(), nil
+		}
 		return nil, fmt.Errorf("loading races: %w", err)
 	}
 
 	session_key := getSessionKey(races, "prev")
 	if session_key == 0 {
+		if len(stale) > 0 {
+			return staleTop10(), nil
+		}
 		return nil, fmt.Errorf("no completed race found (session_key=0)")
 	}
 
@@ -704,16 +770,25 @@ func getDriverStandings() ([]driverStandings, error) {
 		),
 	)
 	if err != nil {
+		if len(stale) > 0 {
+			return staleTop10(), nil
+		}
 		return nil, fmt.Errorf("requesting driver standings: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		if len(stale) > 0 {
+			return staleTop10(), nil
+		}
 		return nil, fmt.Errorf("OpenF1 returned status: %s", resp.Status)
 	}
 
 	var standings []driverStandings
 	if err := json.NewDecoder(resp.Body).Decode(&standings); err != nil {
+		if len(stale) > 0 {
+			return staleTop10(), nil
+		}
 		return nil, fmt.Errorf("decoding driver standings: %w", err)
 	}
 
@@ -731,7 +806,7 @@ func getDriverStandings() ([]driverStandings, error) {
 		return nil, err
 	}
 
-	if err := os.WriteFile("data/standings.json", data, 0644); err != nil {
+	if err := writeCacheFile("data/standings.json", data); err != nil {
 		return nil, err
 	}
 
@@ -887,7 +962,7 @@ func getLastStandings() ([]driverStandings, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile("data/last-standings.json", data, 0644); err != nil {
+	if err := writeCacheFile("data/last-standings.json", data); err != nil {
 		return nil, err
 	}
 
@@ -959,19 +1034,21 @@ func getNextSession() (*allSession, error) {
 	// that would meke json parsing for me easier , not having to store the time
 	// will think
 	// made a constant year at top
+	var stale []allSession
 	data, err := os.ReadFile("data/sessions.json")
 
 	if err == nil {
 		var cache allSessionCache
 
-		if json.Unmarshal(data, &cache) == nil &&
-			!cache.UpdatedAt.IsZero() &&
-			time.Since(cache.UpdatedAt) < 120*time.Hour {
+		if json.Unmarshal(data, &cache) == nil && len(cache.AllSessions) > 0 {
+			stale = cache.AllSessions
+			if !cache.UpdatedAt.IsZero() && time.Since(cache.UpdatedAt) < 120*time.Hour {
 
-			next := findNextSession(cache.AllSessions)
+				next := findNextSession(cache.AllSessions)
 
-			return next, nil
+				return next, nil
 
+			}
 		}
 	}
 
@@ -983,15 +1060,24 @@ func getNextSession() (*allSession, error) {
 	resp, err := httpClient.Get(url)
 
 	if err != nil {
+		if len(stale) > 0 {
+			return findNextSession(stale), nil
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		if len(stale) > 0 {
+			return findNextSession(stale), nil
+		}
 		return nil, fmt.Errorf("OpenF1 returned status: %s", resp.Status)
 	}
 
 	var all_sessions []allSession
 	if err := json.NewDecoder(resp.Body).Decode(&all_sessions); err != nil {
+		if len(stale) > 0 {
+			return findNextSession(stale), nil
+		}
 		return nil, fmt.Errorf("decoding driver names: %w", err)
 	}
 
@@ -1010,7 +1096,7 @@ func getNextSession() (*allSession, error) {
 		return nil, err
 	}
 
-	if err := os.WriteFile("data/sessions.json", cacheData, 0644); err != nil {
+	if err := writeCacheFile("data/sessions.json", cacheData); err != nil {
 		return nil, err
 	}
 
@@ -1020,19 +1106,19 @@ func getNextSession() (*allSession, error) {
 
 }
 
-func initDB() {
+func initDB() error {
 	var err error
 	// DB lives in data/, not the workdir: in Docker the process runs as
 	// USER app, which can only write /app/data (root owns /app), and
 	// compose persists /app/data via the franz-data volume — so this
 	// both starts in the container and keeps subscriptions across rebuilds.
 	if err := os.MkdirAll("data", 0755); err != nil {
-		log.Fatal("Failed to create data dir for database:", err)
+		return fmt.Errorf("failed to create data dir for database: %w", err)
 	}
 	// i find it very hard to get docs for mttn sqlite3 for some reason
 	DB, err = sql.Open("sqlite3", "./data/f1bot.db")
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	query := `
 	CREATE TABLE IF NOT EXISTS subscriptions (
@@ -1046,12 +1132,16 @@ func initDB() {
 	`
 	_, err = DB.Exec(query)
 	if err != nil {
-		log.Fatal("Faled to create subscription table:", err)
+		return fmt.Errorf("failed to create subscription table: %w", err)
 	}
 	log.Println("database initzlised sccuesfuly")
+	return nil
 }
 
 func addSubscription(serverID, channelID, userID string) error {
+	if DB == nil {
+		return errors.New("database unavailable")
+	}
 	query := `
 	INSERT INTO subscriptions (
 		server_id,
@@ -1077,6 +1167,9 @@ type Subscription struct {
 }
 
 func getSubscriptions() ([]Subscription, error) {
+	if DB == nil {
+		return nil, errors.New("database unavailable")
+	}
 	// COALESCE: fresh rows have NULL last_session_id, and scanning NULL
 	// into a string/bool fails, which would break every notification check.
 	rows, err := DB.Query(`
@@ -1115,6 +1208,9 @@ func getSubscriptions() ([]Subscription, error) {
 }
 
 func removeSubscription(serverID string) error {
+	if DB == nil {
+		return errors.New("database unavailable")
+	}
 	_, err := DB.Exec(
 		"DELETE FROM subscriptions WHERE server_id = ?",
 		serverID,
@@ -1177,6 +1273,9 @@ func shouldSendNotification(sub Subscription, session Session) bool {
 }
 
 func updateNotification(server_id string, session_id string) error {
+	if DB == nil {
+		return errors.New("database unavailable")
+	}
 	query := `
     UPDATE subscriptions
     SET last_session_id = ?,
@@ -1277,16 +1376,31 @@ func checkNotifications(bot *gofluxer.Bot, sessions []Session) {
 
 func main() {
 	godotenv.Load()
-	initDB()
+	if err := initDB(); err != nil {
+		log.Printf("database unavailable, continuing without subscriptions: %v", err)
+	}
 
-	bot := gofluxer.NewBot(os.Getenv("BOT_TOKEN"), PREFIX)
+	token := os.Getenv("BOT_TOKEN")
+	if token == "" {
+		log.Fatal("BOT_TOKEN is not set (check .env)")
+	}
+	bot := gofluxer.NewBot(token, PREFIX)
 
 	bot.OnReady(func() {
 		updateStatus := func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("panic in status update: %v", r)
+				}
+			}()
 			status := getStatus()
 
 			log.Println("Status:", status)
 
+			if bot.Conn == nil {
+				log.Println("Presence skipped: no gateway connection")
+				return
+			}
 			err := bot.Conn.WriteJSON(map[string]any{
 				"op": 3,
 				"d": map[string]any{
@@ -1580,6 +1694,7 @@ func main() {
 		next, err := getNextSession()
 		if err != nil {
 			log.Printf("getNextSession: %v", err)
+			bot.SendMessage(m.ChannelID, "Failed to fetch next session: "+err.Error())
 			return
 		}
 
