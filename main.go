@@ -734,6 +734,8 @@ type driverNumberType struct {
 	HeadshotURL   string `json:"headshot_url"`
 	CountryCode   string `json:"country_code"`
 	CountryName   string `json:"country_name"`
+	WikipediaURL  string `json:"wikipedia_url"`
+	DateOfBirth   string `json:"date_of_birth"`
 }
 
 // Exported fields: encoding/json silently skips unexported ones, which would
@@ -752,6 +754,8 @@ type jolpiDriversResp struct {
 				GivenName       string `json:"givenName"`
 				FamilyName      string `json:"familyName"`
 				Nationality     string `json:"nationality"`
+				URL             string `json:"url"`
+				DateOfBirth     string `json:"dateOfBirth"`
 			} `json:"Drivers"`
 		} `json:"DriverTable"`
 	} `json:"MRData"`
@@ -788,7 +792,7 @@ func fetchJolpiDrivers(round int, sessionKey int) ([]driverNumberType, error) {
 				name = d.FamilyName
 			}
 		}
-		drivers = append(drivers, driverNumberType{SessionKey: sessionKey, DriverNumber: num, FullName: name, BroadcastName: name, NameAcronym: d.Code, TeamName: teams[num], FirstName: d.GivenName, LastName: d.FamilyName, CountryName: d.Nationality})
+		drivers = append(drivers, driverNumberType{SessionKey: sessionKey, DriverNumber: num, FullName: name, BroadcastName: name, NameAcronym: d.Code, TeamName: teams[num], FirstName: d.GivenName, LastName: d.FamilyName, CountryName: d.Nationality, WikipediaURL: d.URL, DateOfBirth: d.DateOfBirth})
 	}
 	if len(drivers) == 0 {
 		return nil, fmt.Errorf("Jolpica returned no drivers")
@@ -1458,6 +1462,51 @@ func getNextSession() (*allSession, error) {
 	return findNextSession(all_sessions), nil
 }
 
+func migrateSessionIDs() {
+	if DB == nil {
+		return
+	}
+	data, err := os.ReadFile("data/race.json")
+	if err != nil {
+		return
+	}
+	var cache RaceCache
+	if json.Unmarshal(data, &cache) != nil || len(cache.Races) == 0 {
+		return
+	}
+	for _, s := range cache.Races {
+		if s.Round != 0 {
+			return
+		}
+	}
+	schedule, err := fetchJolpiSchedule()
+	if err != nil {
+		log.Printf("session id migration skipped: %v", err)
+		return
+	}
+	type key struct {
+		t    int64
+		name string
+	}
+	fresh := make(map[key]int)
+	for _, r := range schedule {
+		for _, s := range jolpiSessions(r) {
+			fresh[key{s.DateStart.Unix(), s.SessionName}] = s.SessionKey
+		}
+	}
+	for _, old := range cache.Races {
+		newKey, ok := fresh[key{old.DateStart.Unix(), old.SessionName}]
+		if !ok || newKey == old.SessionKey {
+			continue
+		}
+		_, err := DB.Exec("UPDATE subscriptions SET last_session_id = ? WHERE last_session_id = ?", fmt.Sprint(newKey), fmt.Sprint(old.SessionKey))
+		if err != nil {
+			log.Printf("session id migration update: %v", err)
+		}
+	}
+	log.Println("session id migration done")
+}
+
 func initDB() error {
 	var err error
 	// DB lives in data/, not the workdir: in Docker the process runs as
@@ -1747,6 +1796,7 @@ func main() {
 	if err := initDB(); err != nil {
 		log.Printf("database unavailable, continuing without subscriptions: %v", err)
 	}
+	migrateSessionIDs()
 
 	token := os.Getenv("BOT_TOKEN")
 	if token == "" {
@@ -1957,21 +2007,40 @@ func main() {
 			team = "Unknown"
 		}
 
-		fields := make([]EmbedField, 0, 1)
+		fields := make([]EmbedField, 0, 3)
 		fields = append(fields, EmbedField{
 			Name:   fmt.Sprintf("#%d %s", driver.DriverNumber, name),
 			Value:  fmt.Sprintf("Team %s | Country %s", team, driverCountry(driver)),
 			Inline: true,
 		})
+		if driver.DateOfBirth != "" {
+			born := driver.DateOfBirth
+			if dob, derr := time.Parse("2006-01-02", driver.DateOfBirth); derr == nil {
+				born = dob.Format("02 Jan 2006")
+				age := time.Now().Year() - dob.Year()
+				if time.Now().Before(time.Date(time.Now().Year(), dob.Month(), dob.Day(), 0, 0, 0, 0, time.UTC)) {
+					age--
+				}
+				born = fmt.Sprintf("%s (%d years old)", born, age)
+			}
+			fields = append(fields, EmbedField{Name: "Date of birth", Value: born, Inline: true})
+		}
+		if driver.WikipediaURL != "" {
+			fields = append(fields, EmbedField{Name: "Wikipedia", Value: fmt.Sprintf("[Read article](%s)", driver.WikipediaURL), Inline: false})
+		}
 
 		// team_colour comes from OpenF1 as a bare hex string such as "FF8000".
 		colInt, err := strconv.ParseInt(strings.TrimPrefix(driver.TeamColour, "#"), 16, 32)
 		if err != nil {
 			colInt = 0
 		}
+		embedURL := siteURL
+		if driver.WikipediaURL != "" {
+			embedURL = driver.WikipediaURL
+		}
 		embed := Embed{
 			Title:  "Your driver is " + name,
-			URL:    siteURL,
+			URL:    embedURL,
 			Color:  int(colInt),
 			Fields: fields,
 		}

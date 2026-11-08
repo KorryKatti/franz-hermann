@@ -18,7 +18,7 @@ All commands use the `>` prefix (e.g. `>who 1`).
 | --- | --- |
 | `>ping` | Live latency to Fluxer + Jolpica, plus CPU/memory usage. Jolpica is probed at most once per 30 minutes; pings in between report the cached value |
 | `>ds [title]` | Top 10 driver standings from the latest race session |
-| `>who <driver number>` | Driver name, team and country by car number (e.g. `>who 1`). Drivers without a headshot (e.g. reserve driver `#50`) just get no photo |
+| `>who <driver number>` | Driver name, team, country, date of birth and Wikipedia link by car number (e.g. `>who 1`) |
 | `>last [title]` | Top 10 results from the last race |
 | `>next [title]` | Next session with location, circuit, country and countdown |
 | `>follow` | Subscribe this channel to race/sprint reminders 30 minutes before start |
