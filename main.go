@@ -40,6 +40,7 @@ type Session struct {
 	Location         string    `json:"location"`
 	GMTOffset        string    `json:"gmt_offset"`
 	Year             int       `json:"year"`
+	Round            int       `json:"round"`
 	IsCancelled      bool      `json:"is_cancelled"`
 }
 
@@ -82,9 +83,8 @@ func asyncHandler(bot *gofluxer.Bot, fn func(m *gofluxer.Message, args []string)
 // startTime is captured at package init for the `ping` uptime report.
 var startTime = time.Now()
 
-// openF1PingTTL bounds OpenF1 ping probes: at most one real request
-// every 2 hours, everybody else gets the cached latency.
-const openF1PingTTL = 2 * time.Hour
+// pingTTL bounds Jolpica ping probes.
+const pingTTL = 30 * time.Minute
 
 // siteURL is the bot's page, linked from every embed's title.
 const siteURL = "https://korrykatti.github.io/franz-hermann"
@@ -96,7 +96,7 @@ type pingCache struct {
 	checkedAt time.Time
 }
 
-var openF1Ping pingCache
+var jolpiPing pingCache
 
 // measureLatency does one timed GET and drains the body (connection
 // reuse). The status code is reported via err, but the latency is
@@ -109,6 +109,7 @@ func measureLatency(url string, authToken string) (time.Duration, error) {
 	if authToken != "" {
 		req.Header.Set("Authorization", "Bot "+authToken)
 	}
+	req.Header.Set("User-Agent", "FranzHermann/1.0")
 	start := time.Now()
 	resp, err := httpClient.Do(req)
 	latency := time.Since(start)
@@ -123,23 +124,16 @@ func measureLatency(url string, authToken string) (time.Duration, error) {
 	return latency, nil
 }
 
-// getOpenF1Ping returns the OpenF1 latency, probing at most once per
-// openF1PingTTL. fresh reports whether a new probe was just made.
-func getOpenF1Ping() (latency time.Duration, err error, checkedAt time.Time, fresh bool) {
-	openF1Ping.mu.Lock()
-	defer openF1Ping.mu.Unlock()
-	if !openF1Ping.checkedAt.IsZero() && time.Since(openF1Ping.checkedAt) < openF1PingTTL {
-		return openF1Ping.latency, openF1Ping.err, openF1Ping.checkedAt, false
+// getJolpiPing returns the Jolpica latency.
+func getJolpiPing() (latency time.Duration, err error, checkedAt time.Time, fresh bool) {
+	jolpiPing.mu.Lock()
+	defer jolpiPing.mu.Unlock()
+	if !jolpiPing.checkedAt.IsZero() && time.Since(jolpiPing.checkedAt) < pingTTL {
+		return jolpiPing.latency, jolpiPing.err, jolpiPing.checkedAt, false
 	}
-	// Tiny real API call (one driver row, ~400 bytes) — a representative
-	// OpenF1 round-trip. session_key 11404 is a finished historical
-	// session, so it stays a valid probe whenever the API is open.
-	// During a live session OpenF1 401s even historical requests
-	// (paid key or wait it out), so the ping handler reports that
-	// case as "live session, api limited" rather than an error.
-	latency, err = measureLatency("https://api.openf1.org/v1/drivers?driver_number=1&session_key=11404", "")
-	openF1Ping.latency, openF1Ping.err, openF1Ping.checkedAt = latency, err, time.Now()
-	return latency, err, openF1Ping.checkedAt, true
+	latency, err = measureLatency("https://api.jolpi.ca/ergast/f1/current.json", "")
+	jolpiPing.latency, jolpiPing.err, jolpiPing.checkedAt = latency, err, time.Now()
+	return latency, err, jolpiPing.checkedAt, true
 }
 
 // --- system resource usage, read from /proc (Linux; the container is
@@ -314,6 +308,9 @@ var raceUnderway atomic.Bool
 
 var lastRaceFetchMu sync.Mutex
 var lastRaceFetch time.Time
+var lastStandingsFetch time.Time
+var lastDriversFetch time.Time
+var lastNextFetch time.Time
 
 var cacheWriteMu sync.Mutex
 
@@ -331,20 +328,150 @@ var statusIndex int
 var rotatingStatuses []string
 var lastStatusRotation time.Time
 
+func jolpiGet(url string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "FranzHermann/1.0")
+	return httpClient.Do(req)
+}
+
+type jolpiSessionTime struct {
+	Date string `json:"date"`
+	Time string `json:"time"`
+}
+
+type jolpiRace struct {
+	Season  string `json:"season"`
+	Round   string `json:"round"`
+	Circuit struct {
+		CircuitName string `json:"circuitName"`
+		Location    struct {
+			Locality string `json:"locality"`
+			Country  string `json:"country"`
+		} `json:"Location"`
+	} `json:"Circuit"`
+	Date             string            `json:"date"`
+	Time             string            `json:"time"`
+	FirstPractice    *jolpiSessionTime `json:"FirstPractice"`
+	SecondPractice   *jolpiSessionTime `json:"SecondPractice"`
+	ThirdPractice    *jolpiSessionTime `json:"ThirdPractice"`
+	Qualifying       *jolpiSessionTime `json:"Qualifying"`
+	Sprint           *jolpiSessionTime `json:"Sprint"`
+	SprintQualifying *jolpiSessionTime `json:"SprintQualifying"`
+}
+
+type jolpiScheduleResp struct {
+	MRData struct {
+		RaceTable struct {
+			Races []jolpiRace `json:"Races"`
+		} `json:"RaceTable"`
+	} `json:"MRData"`
+}
+
+func parseJolpiTime(date, tm string) time.Time {
+	t, err := time.Parse(time.RFC3339, date+"T"+tm)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+func jolpiSessionKey(round, code int) int { return year*100000 + round*100 + code }
+
+type jolpiSessionSpec struct {
+	name  string
+	typ   string
+	code  int
+	start time.Time
+	dur   time.Duration
+}
+
+func jolpiSpecs(r jolpiRace) []jolpiSessionSpec {
+	var specs []jolpiSessionSpec
+	add := func(name, typ string, code int, t *jolpiSessionTime, dur time.Duration) {
+		if t == nil {
+			return
+		}
+		start := parseJolpiTime(t.Date, t.Time)
+		if start.IsZero() {
+			return
+		}
+		specs = append(specs, jolpiSessionSpec{name, typ, code, start, dur})
+	}
+	add("Practice 1", "Practice", 1, r.FirstPractice, time.Hour)
+	add("Practice 2", "Practice", 2, r.SecondPractice, time.Hour)
+	add("Practice 3", "Practice", 3, r.ThirdPractice, time.Hour)
+	add("Qualifying", "Qualifying", 4, r.Qualifying, time.Hour)
+	add("Sprint Qualifying", "Qualifying", 5, r.SprintQualifying, 45*time.Minute)
+	add("Sprint", "Race", 6, r.Sprint, time.Hour)
+	add("Race", "Race", 7, &jolpiSessionTime{r.Date, r.Time}, 2*time.Hour)
+	return specs
+}
+
+func fetchJolpiSchedule() ([]jolpiRace, error) {
+	resp, err := jolpiGet("https://api.jolpi.ca/ergast/f1/" + strconv.Itoa(year) + ".json?limit=100")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Jolpica returned status: %s", resp.Status)
+	}
+	var out jolpiScheduleResp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	if len(out.MRData.RaceTable.Races) == 0 {
+		return nil, fmt.Errorf("Jolpica returned no races")
+	}
+	return out.MRData.RaceTable.Races, nil
+}
+
+func jolpiSessions(r jolpiRace) []Session {
+	round, _ := strconv.Atoi(r.Round)
+	var out []Session
+	for _, s := range jolpiSpecs(r) {
+		if s.name != "Race" && s.name != "Sprint" {
+			continue
+		}
+		out = append(out, Session{
+			SessionKey: jolpiSessionKey(round, s.code), SessionType: s.typ, SessionName: s.name,
+			DateStart: s.start, DateEnd: s.start.Add(s.dur), CircuitShortName: r.Circuit.CircuitName,
+			CountryName: r.Circuit.Location.Country, Location: r.Circuit.Location.Locality, Year: year, Round: round,
+		})
+	}
+	return out
+}
+
+func jolpiAllSessions(r jolpiRace) []allSession {
+	round, _ := strconv.Atoi(r.Round)
+	var out []allSession
+	for _, s := range jolpiSpecs(r) {
+		out = append(out, allSession{
+			SessionKey: jolpiSessionKey(round, s.code), SessionType: s.typ, SessionName: s.name,
+			DateStart: s.start, DateEnd: s.start.Add(s.dur), CircuitShortName: r.Circuit.CircuitName,
+			CountryName: r.Circuit.Location.Country, Location: r.Circuit.Location.Locality, Year: year, Round: round,
+		})
+	}
+	return out
+}
+
 func getRaces() ([]Session, error) {
-	raceTTL := 72 * time.Hour
+	raceTTL := 12 * time.Hour
+	cooldown := 30 * time.Minute
 	if raceUnderway.Load() {
-		raceTTL = 35 * time.Minute
+		raceTTL = 30 * time.Minute
+		cooldown = 15 * time.Minute
 	}
 
 	var stale []Session
 
 	data, err := os.ReadFile("data/race.json")
-
 	if err == nil {
 		var cache RaceCache
-		if json.Unmarshal(data, &cache) == nil &&
-			!cache.UpdatedAt.IsZero() {
+		if json.Unmarshal(data, &cache) == nil && !cache.UpdatedAt.IsZero() {
 			stale = cache.Races
 			if time.Since(cache.UpdatedAt) < raceTTL {
 				return cache.Races, nil
@@ -352,22 +479,38 @@ func getRaces() ([]Session, error) {
 		}
 	}
 
-	// stale cache on api failure so we dont hammer a 429
 	lastRaceFetchMu.Lock()
-	if len(stale) > 0 && !lastRaceFetch.IsZero() && time.Since(lastRaceFetch) < raceTTL {
+	if len(stale) > 0 && !lastRaceFetch.IsZero() && time.Since(lastRaceFetch) < cooldown {
 		lastRaceFetchMu.Unlock()
 		return stale, nil
 	}
 	lastRaceFetch = time.Now()
 	lastRaceFetchMu.Unlock()
 
-	url := fmt.Sprintf(
-		"https://api.openf1.org/v1/sessions?year=%d&session_type=Race",
-		year,
-	)
+	if schedule, ferr := fetchJolpiSchedule(); ferr == nil {
+		var races []Session
+		for _, r := range schedule {
+			races = append(races, jolpiSessions(r)...)
+		}
+		if len(races) > 0 {
+			os.MkdirAll("data", 0755)
+			cache := RaceCache{UpdatedAt: time.Now().UTC(), Races: races}
+			data, _ = json.MarshalIndent(cache, "", "  ")
+			if err := writeCacheFile("data/race.json", data); err != nil {
+				return nil, err
+			}
+			return races, nil
+		}
+	} else if len(stale) > 0 {
+		return stale, nil
+	}
 
+	if raceUnderway.Load() {
+		return nil, fmt.Errorf("Jolpica schedule unavailable during live session")
+	}
+
+	url := fmt.Sprintf("https://api.openf1.org/v1/sessions?year=%d&session_type=Race", year)
 	resp, err := httpClient.Get(url)
-
 	if err != nil {
 		if len(stale) > 0 {
 			return stale, nil
@@ -381,7 +524,6 @@ func getRaces() ([]Session, error) {
 		}
 		return nil, fmt.Errorf("OpenF1 returned status: %s", resp.Status)
 	}
-
 	var races []Session
 	if err := json.NewDecoder(resp.Body).Decode(&races); err != nil {
 		if len(stale) > 0 {
@@ -389,19 +531,12 @@ func getRaces() ([]Session, error) {
 		}
 		return nil, err
 	}
-
 	os.MkdirAll("data", 0755)
-
-	cache := RaceCache{
-		UpdatedAt: time.Now().UTC(),
-		Races:     races,
-	}
-
+	cache := RaceCache{UpdatedAt: time.Now().UTC(), Races: races}
 	data, _ = json.MarshalIndent(cache, "", "  ")
 	if err := writeCacheFile("data/race.json", data); err != nil {
 		return nil, err
 	}
-
 	return races, nil
 }
 
@@ -538,6 +673,7 @@ type driverStandings struct {
 
 type driverStandingCache struct {
 	UpdatedAt time.Time         `json:"updated_at"`
+	Round     int               `json:"round"`
 	Standings []driverStandings `json:"standings"`
 }
 
@@ -607,6 +743,59 @@ type driverNumberCache struct {
 	Drivers     []driverNumberType `json:"drivers"`
 }
 
+type jolpiDriversResp struct {
+	MRData struct {
+		DriverTable struct {
+			Drivers []struct {
+				PermanentNumber string `json:"permanentNumber"`
+				Code            string `json:"code"`
+				GivenName       string `json:"givenName"`
+				FamilyName      string `json:"familyName"`
+				Nationality     string `json:"nationality"`
+			} `json:"Drivers"`
+		} `json:"DriverTable"`
+	} `json:"MRData"`
+}
+
+func fetchJolpiDrivers(round int, sessionKey int) ([]driverNumberType, error) {
+	url := "https://api.jolpi.ca/ergast/f1/" + strconv.Itoa(year) + "/" + strconv.Itoa(round) + "/drivers.json?limit=100"
+	resp, err := jolpiGet(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Jolpica returned status: %s", resp.Status)
+	}
+	var out jolpiDriversResp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	_, teams, _ := fetchJolpiStandings(round, sessionKey)
+	var drivers []driverNumberType
+	for _, d := range out.MRData.DriverTable.Drivers {
+		num := atoi(d.PermanentNumber)
+		if len(teams) > 0 {
+			if _, ok := teams[num]; !ok {
+				continue
+			}
+		}
+		name := d.GivenName
+		if d.FamilyName != "" {
+			if name != "" {
+				name = name + " " + d.FamilyName
+			} else {
+				name = d.FamilyName
+			}
+		}
+		drivers = append(drivers, driverNumberType{SessionKey: sessionKey, DriverNumber: num, FullName: name, BroadcastName: name, NameAcronym: d.Code, TeamName: teams[num], FirstName: d.GivenName, LastName: d.FamilyName, CountryName: d.Nationality})
+	}
+	if len(drivers) == 0 {
+		return nil, fmt.Errorf("Jolpica returned no drivers")
+	}
+	return drivers, nil
+}
+
 func getDriverName(driverNumber int) (driverNumberType, error) {
 	var stale []driverNumberType
 	findStale := func() (driverNumberType, bool) {
@@ -624,7 +813,7 @@ func getDriverName(driverNumber int) (driverNumberType, error) {
 		var cache driverNumberCache
 		if json.Unmarshal(data, &cache) == nil && len(cache.Drivers) > 0 {
 			stale = cache.Drivers
-			if !cache.LastUpdated.IsZero() && time.Since(cache.LastUpdated) < 480*time.Hour {
+			if !cache.LastUpdated.IsZero() && time.Since(cache.LastUpdated) < 72*time.Hour {
 				for _, d := range cache.Drivers {
 					if d.DriverNumber == driverNumber {
 						return d, nil
@@ -652,6 +841,37 @@ func getDriverName(driverNumber int) (driverNumberType, error) {
 			return d, nil
 		}
 		return driverNumberType{}, fmt.Errorf("no completed race found (session_key=0)")
+	}
+	prev, _ := getSessionFromKey(races, session_key)
+	if len(stale) > 0 && !lastDriversFetch.IsZero() && time.Since(lastDriversFetch) < 30*time.Minute {
+		if d, ok := findStale(); ok {
+			return d, nil
+		}
+		return driverNumberType{}, fmt.Errorf("%w: #%d", errDriverNotFound, driverNumber)
+	}
+	lastDriversFetch = time.Now()
+	if prev.Round > 0 {
+		drivers, ferr := fetchJolpiDrivers(prev.Round, session_key)
+		if ferr == nil && len(drivers) > 0 {
+			os.MkdirAll("data", 0755)
+			cache := driverNumberCache{LastUpdated: time.Now().UTC(), Drivers: drivers}
+			cacheData, _ := json.MarshalIndent(cache, "", "  ")
+			if err := writeCacheFile("data/drivers.json", cacheData); err != nil {
+				return driverNumberType{}, err
+			}
+			for _, d := range drivers {
+				if d.DriverNumber == driverNumber {
+					return d, nil
+				}
+			}
+			return driverNumberType{}, fmt.Errorf("%w: #%d", errDriverNotFound, driverNumber)
+		}
+		if d, ok := findStale(); ok {
+			return d, nil
+		}
+		if raceUnderway.Load() {
+			return driverNumberType{}, fmt.Errorf("Jolpica drivers unavailable: %v", ferr)
+		}
 	}
 
 	resp, err := httpClient.Get(
@@ -722,31 +942,87 @@ func driverCountry(d driverNumberType) string {
 	return "Unknown"
 }
 
-func getDriverStandings() ([]driverStandings, error) {
-	// so the thing here is it will take session id of last race conducted and give top 10
-	var stale []driverStandings
-	data, err := os.ReadFile("data/standings.json")
+func atoi(s string) int     { n, _ := strconv.Atoi(s); return n }
+func atof(s string) float64 { n, _ := strconv.ParseFloat(s, 64); return n }
 
+type jolpiStandingsResp struct {
+	MRData struct {
+		StandingsTable struct {
+			StandingsLists []struct {
+				DriverStandings []struct {
+					Position string `json:"position"`
+					Points   string `json:"points"`
+					Driver   struct {
+						PermanentNumber string `json:"permanentNumber"`
+					} `json:"Driver"`
+					Constructors []struct {
+						Name string `json:"name"`
+					} `json:"Constructors"`
+				} `json:"DriverStandings"`
+			} `json:"StandingsLists"`
+		} `json:"StandingsTable"`
+	} `json:"MRData"`
+}
+
+func fetchJolpiStandings(round int, sessionKey int) ([]driverStandings, map[int]string, error) {
+	url := "https://api.jolpi.ca/ergast/f1/" + strconv.Itoa(year) + "/" + strconv.Itoa(round) + "/driverstandings.json?limit=100"
+	resp, err := jolpiGet(url)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, fmt.Errorf("Jolpica returned status: %s", resp.Status)
+	}
+	var out jolpiStandingsResp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, nil, err
+	}
+	var standings []driverStandings
+	teams := make(map[int]string)
+	for _, list := range out.MRData.StandingsTable.StandingsLists {
+		for _, d := range list.DriverStandings {
+			num := atoi(d.Driver.PermanentNumber)
+			standings = append(standings, driverStandings{SessionKey: sessionKey, DriverNumber: num, PositionCurrent: atoi(d.Position), PointsCurrent: atof(d.Points)})
+			if len(d.Constructors) > 0 {
+				teams[num] = d.Constructors[0].Name
+			}
+		}
+		if len(standings) > 0 {
+			break
+		}
+	}
+	if len(standings) == 0 {
+		return nil, nil, fmt.Errorf("Jolpica returned no standings")
+	}
+	return standings, teams, nil
+}
+
+func getDriverStandings() ([]driverStandings, error) {
+	standingsTTL := 6 * time.Hour
+	cooldown := 30 * time.Minute
+	if raceUnderway.Load() {
+		standingsTTL = 30 * time.Minute
+		cooldown = 15 * time.Minute
+	}
+	var stale []driverStandings
+	var staleRound int
+	var staleUpdated time.Time
+	data, err := os.ReadFile("data/standings.json")
 	if err == nil {
 		var cache driverStandingCache
 		if json.Unmarshal(data, &cache) == nil && len(cache.Standings) > 0 {
 			stale = cache.Standings
-			if !cache.UpdatedAt.IsZero() && time.Since(cache.UpdatedAt) < 72*time.Hour {
-				if len(cache.Standings) > 10 {
-					return cache.Standings[:10], nil
-				}
-				return cache.Standings, nil
-			}
+			staleRound = cache.Round
+			staleUpdated = cache.UpdatedAt
 		}
 	}
-
 	staleTop10 := func() []driverStandings {
 		if len(stale) > 10 {
 			return stale[:10]
 		}
 		return stale
 	}
-
 	races, err := getRaces()
 	if err != nil {
 		if len(stale) > 0 {
@@ -754,7 +1030,6 @@ func getDriverStandings() ([]driverStandings, error) {
 		}
 		return nil, fmt.Errorf("loading races: %w", err)
 	}
-
 	session_key := getSessionKey(races, "prev")
 	if session_key == 0 {
 		if len(stale) > 0 {
@@ -762,13 +1037,36 @@ func getDriverStandings() ([]driverStandings, error) {
 		}
 		return nil, fmt.Errorf("no completed race found (session_key=0)")
 	}
-
-	resp, err := httpClient.Get(
-		fmt.Sprintf(
-			"https://api.openf1.org/v1/championship_drivers?session_key=%d",
-			session_key,
-		),
-	)
+	prev, _ := getSessionFromKey(races, session_key)
+	if len(stale) > 0 && staleRound == prev.Round && staleRound != 0 && !staleUpdated.IsZero() && time.Since(staleUpdated) < standingsTTL {
+		return staleTop10(), nil
+	}
+	if len(stale) > 0 && !lastStandingsFetch.IsZero() && time.Since(lastStandingsFetch) < cooldown {
+		return staleTop10(), nil
+	}
+	lastStandingsFetch = time.Now()
+	if prev.Round > 0 {
+		standings, _, ferr := fetchJolpiStandings(prev.Round, session_key)
+		if ferr == nil && len(standings) > 0 {
+			os.MkdirAll("data", 0755)
+			cache := driverStandingCache{UpdatedAt: time.Now().UTC(), Round: prev.Round, Standings: standings}
+			data, _ := json.MarshalIndent(cache, "", "  ")
+			if err := writeCacheFile("data/standings.json", data); err != nil {
+				return nil, err
+			}
+			if len(standings) > 10 {
+				standings = standings[:10]
+			}
+			return standings, nil
+		}
+		if len(stale) > 0 {
+			return staleTop10(), nil
+		}
+		if raceUnderway.Load() {
+			return nil, fmt.Errorf("Jolpica standings unavailable during live session")
+		}
+	}
+	resp, err := httpClient.Get(fmt.Sprintf("https://api.openf1.org/v1/championship_drivers?session_key=%d", session_key))
 	if err != nil {
 		if len(stale) > 0 {
 			return staleTop10(), nil
@@ -776,14 +1074,12 @@ func getDriverStandings() ([]driverStandings, error) {
 		return nil, fmt.Errorf("requesting driver standings: %w", err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		if len(stale) > 0 {
 			return staleTop10(), nil
 		}
 		return nil, fmt.Errorf("OpenF1 returned status: %s", resp.Status)
 	}
-
 	var standings []driverStandings
 	if err := json.NewDecoder(resp.Body).Decode(&standings); err != nil {
 		if len(stale) > 0 {
@@ -791,32 +1087,19 @@ func getDriverStandings() ([]driverStandings, error) {
 		}
 		return nil, fmt.Errorf("decoding driver standings: %w", err)
 	}
-
-	if err := os.MkdirAll("data", 0755); err != nil {
-		return nil, err
-	}
-
-	cache := driverStandingCache{
-		UpdatedAt: time.Now().UTC(),
-		Standings: standings,
-	}
-
+	os.MkdirAll("data", 0755)
+	cache := driverStandingCache{UpdatedAt: time.Now().UTC(), Standings: standings}
 	data, err = json.MarshalIndent(cache, "", "  ")
 	if err != nil {
 		return nil, err
 	}
-
 	if err := writeCacheFile("data/standings.json", data); err != nil {
 		return nil, err
 	}
-
-	// return top 10
 	if len(standings) > 10 {
 		standings = standings[:10]
 	}
-
 	return standings, nil
-
 }
 
 func getSessionFromKey(sessions []Session, key int) (Session, error) {
@@ -902,6 +1185,55 @@ type lastStandingsCache struct {
 	Standings  []sessionResult `json:"standings"`
 }
 
+type jolpiResultsResp struct {
+	MRData struct {
+		RaceTable struct {
+			Races []struct {
+				Results []struct {
+					Number   string `json:"number"`
+					Position string `json:"position"`
+					Points   string `json:"points"`
+					Laps     string `json:"laps"`
+					Status   string `json:"status"`
+					Driver   struct {
+						PermanentNumber string `json:"permanentNumber"`
+					} `json:"Driver"`
+				} `json:"Results"`
+			} `json:"Races"`
+		} `json:"RaceTable"`
+	} `json:"MRData"`
+}
+
+func fetchJolpiResults(round int, sessionKey int) ([]sessionResult, error) {
+	url := "https://api.jolpi.ca/ergast/f1/" + strconv.Itoa(year) + "/" + strconv.Itoa(round) + "/results.json?limit=100"
+	resp, err := jolpiGet(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Jolpica returned status: %s", resp.Status)
+	}
+	var out jolpiResultsResp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	var results []sessionResult
+	for _, race := range out.MRData.RaceTable.Races {
+		for _, r := range race.Results {
+			num := atoi(r.Number)
+			if num == 0 {
+				num = atoi(r.Driver.PermanentNumber)
+			}
+			results = append(results, sessionResult{SessionKey: sessionKey, DriverNumber: num, Position: atoi(r.Position), Points: atof(r.Points), NumberOfLaps: atoi(r.Laps), DNF: r.Status == "Retired"})
+		}
+	}
+	if len(results) == 0 {
+		return nil, fmt.Errorf("Jolpica returned no results yet")
+	}
+	return results, nil
+}
+
 func getLastStandings() ([]driverStandings, error) {
 	sessions, err := getRaces()
 	if err != nil {
@@ -922,6 +1254,23 @@ func getLastStandings() ([]driverStandings, error) {
 		}
 	}
 
+	prev, _ := getSessionFromKey(sessions, sessionKey)
+	if prev.Round > 0 {
+		results, ferr := fetchJolpiResults(prev.Round, sessionKey)
+		if ferr == nil && len(results) > 0 {
+			sort.Slice(results, func(i, j int) bool { return results[i].Position < results[j].Position })
+			os.MkdirAll("data", 0755)
+			cache := lastStandingsCache{SessionKey: sessionKey, UpdatedAt: time.Now().UTC(), Standings: results}
+			data, _ := json.MarshalIndent(cache, "", "  ")
+			if err := writeCacheFile("data/last-standings.json", data); err != nil {
+				return nil, err
+			}
+			return mapSessionResults(results), nil
+		}
+		if raceUnderway.Load() {
+			return nil, fmt.Errorf("Jolpica results unavailable: %v", ferr)
+		}
+	}
 	// https://api.openf1.org/v1/session_result?session_key={sessionkey}&position%3C=10
 	resp, err := httpClient.Get(
 		fmt.Sprintf(
@@ -998,6 +1347,7 @@ type allSession struct {
 	Location         string    `json:"location"`
 	GMTOffset        string    `json:"gmt_offset"` // should this have been time.Time too ?
 	Year             int       `json:"year"`
+	Round            int       `json:"round"`
 	IsCancelled      bool      `json:"is_cancelled"`
 }
 
@@ -1030,35 +1380,49 @@ func findNextSession(sessions []allSession) *allSession {
 }
 
 func getNextSession() (*allSession, error) {
-	// i am also thinking , cant i get the last modified data by some os params anyways ?
-	// that would meke json parsing for me easier , not having to store the time
-	// will think
-	// made a constant year at top
+	nextTTL := 12 * time.Hour
+	cooldown := 30 * time.Minute
+	if raceUnderway.Load() {
+		nextTTL = 30 * time.Minute
+		cooldown = 15 * time.Minute
+	}
 	var stale []allSession
 	data, err := os.ReadFile("data/sessions.json")
-
 	if err == nil {
 		var cache allSessionCache
-
 		if json.Unmarshal(data, &cache) == nil && len(cache.AllSessions) > 0 {
 			stale = cache.AllSessions
-			if !cache.UpdatedAt.IsZero() && time.Since(cache.UpdatedAt) < 120*time.Hour {
-
-				next := findNextSession(cache.AllSessions)
-
-				return next, nil
-
+			if !cache.UpdatedAt.IsZero() && time.Since(cache.UpdatedAt) < nextTTL {
+				return findNextSession(cache.AllSessions), nil
 			}
 		}
 	}
-
-	url := fmt.Sprintf(
-		"https://api.openf1.org/v1/sessions?year=%d",
-		year,
-	)
-
+	if len(stale) > 0 && !lastNextFetch.IsZero() && time.Since(lastNextFetch) < cooldown {
+		return findNextSession(stale), nil
+	}
+	lastNextFetch = time.Now()
+	if schedule, ferr := fetchJolpiSchedule(); ferr == nil {
+		var all []allSession
+		for _, r := range schedule {
+			all = append(all, jolpiAllSessions(r)...)
+		}
+		if len(all) > 0 {
+			os.MkdirAll("data", 0755)
+			cache := allSessionCache{UpdatedAt: time.Now().UTC(), AllSessions: all}
+			cacheData, _ := json.MarshalIndent(cache, "", "  ")
+			if err := writeCacheFile("data/sessions.json", cacheData); err != nil {
+				return nil, err
+			}
+			return findNextSession(all), nil
+		}
+	} else if len(stale) > 0 {
+		return findNextSession(stale), nil
+	}
+	if raceUnderway.Load() {
+		return nil, fmt.Errorf("Jolpica schedule unavailable during live session")
+	}
+	url := fmt.Sprintf("https://api.openf1.org/v1/sessions?year=%d", year)
 	resp, err := httpClient.Get(url)
-
 	if err != nil {
 		if len(stale) > 0 {
 			return findNextSession(stale), nil
@@ -1072,7 +1436,6 @@ func getNextSession() (*allSession, error) {
 		}
 		return nil, fmt.Errorf("OpenF1 returned status: %s", resp.Status)
 	}
-
 	var all_sessions []allSession
 	if err := json.NewDecoder(resp.Body).Decode(&all_sessions); err != nil {
 		if len(stale) > 0 {
@@ -1080,30 +1443,19 @@ func getNextSession() (*allSession, error) {
 		}
 		return nil, fmt.Errorf("decoding driver names: %w", err)
 	}
-
 	if err := os.MkdirAll("data", 0755); err != nil {
 		return nil, err
 	}
-
 	var cache allSessionCache
-	cache = allSessionCache{
-		UpdatedAt:   time.Now().UTC(),
-		AllSessions: all_sessions,
-	}
-
+	cache = allSessionCache{UpdatedAt: time.Now().UTC(), AllSessions: all_sessions}
 	cacheData, err := json.MarshalIndent(cache, "", "  ")
 	if err != nil {
 		return nil, err
 	}
-
 	if err := writeCacheFile("data/sessions.json", cacheData); err != nil {
 		return nil, err
 	}
-
-	next := findNextSession(all_sessions)
-
-	return next, nil
-
+	return findNextSession(all_sessions), nil
 }
 
 func initDB() error {
@@ -1205,6 +1557,22 @@ func getSubscriptions() ([]Subscription, error) {
 		return nil, err
 	}
 	return subscriptions, nil
+}
+
+func getSubscription(serverID string) (Subscription, bool, error) {
+	if DB == nil {
+		return Subscription{}, false, errors.New("database unavailable")
+	}
+	row := DB.QueryRow(`SELECT server_id, channel_id, invoker_user_id, COALESCE(last_session_id, ''), COALESCE(sent, 0) FROM subscriptions WHERE server_id = ?`, serverID)
+	var sub Subscription
+	err := row.Scan(&sub.ServerID, &sub.ChannelID, &sub.InvokerUserID, &sub.LastSessionID, &sub.Sent)
+	if err == sql.ErrNoRows {
+		return Subscription{}, false, nil
+	}
+	if err != nil {
+		return Subscription{}, false, err
+	}
+	return sub, true, nil
 }
 
 func removeSubscription(serverID string) error {
@@ -1438,22 +1806,15 @@ func main() {
 			fluxerVal += " (error: " + fluxerErr.Error() + ")"
 		}
 
-		// OpenF1: probed at most once per 2 hours, cached in between.
-		// During a live session OpenF1 401s every unauthenticated call
-		// (paid key or wait it out), so say that instead of an error.
-		ofLatency, ofErr, ofCheckedAt, ofFresh := getOpenF1Ping()
+		ofLatency, ofErr, ofCheckedAt, ofFresh := getJolpiPing()
 		ofVal := fmtMs(ofLatency)
 		if ofErr != nil {
-			if strings.Contains(ofErr.Error(), "401") {
-				ofVal += " (live session, api limited)"
-			} else {
-				ofVal += " (error: " + ofErr.Error() + ")"
-			}
+			ofVal += " (error: " + ofErr.Error() + ")"
 		}
 		if ofFresh {
 			ofVal += " (fresh)"
 		} else {
-			ofVal += fmt.Sprintf(" (cached %s ago — rechecked every 2h)", time.Since(ofCheckedAt).Round(time.Minute))
+			ofVal += fmt.Sprintf(" (cached %s ago — rechecked every 30m)", time.Since(ofCheckedAt).Round(time.Minute))
 		}
 
 		procPct, sysPct, cpuOK := sampleCPU()
@@ -1482,7 +1843,7 @@ func main() {
 			Color:       0x5865F2,
 			Fields: []EmbedField{
 				{Name: "Fluxer API", Value: fluxerVal, Inline: true},
-				{Name: "OpenF1 API", Value: ofVal, Inline: true},
+				{Name: "Jolpica API", Value: ofVal, Inline: true},
 				{Name: "CPU", Value: cpuVal, Inline: false},
 				{Name: "Memory", Value: memVal, Inline: false},
 				{Name: "Uptime", Value: fmt.Sprintf("%s · %d goroutines", time.Since(startTime).Round(time.Second), runtime.NumGoroutine()), Inline: false},
@@ -1502,13 +1863,14 @@ func main() {
 			Description: "Commands for the franz-hermann bot. All commands start with " + PREFIX,
 			Color:       0x5865F2,
 			Fields: []EmbedField{
-				{Name: "ping", Value: "Live latency to Fluxer + OpenF1 (OpenF1 probed at most once per 2h), plus CPU/memory usage", Inline: false},
+				{Name: "ping", Value: "Live latency to Fluxer + Jolpica (Jolpica probed at most once per 30m), plus CPU/memory usage", Inline: false},
 				{Name: "ds [title]", Value: "Top 10 driver standings from the latest race session", Inline: false},
 				{Name: "who <driver number>", Value: "Driver name, team and country by car number (e.g. `>who 1`)", Inline: false},
 				{Name: "last [title]", Value: "Top 10 results from the last race", Inline: false},
 				{Name: "next [title]", Value: "Next session with location, circuit, country and countdown", Inline: false},
 				{Name: "follow", Value: "Subscribe this channel to race/sprint reminders 30 minutes before start", Inline: false},
 				{Name: "unfollow", Value: "Unsubscribe this server from race/sprint reminders", Inline: false},
+				{Name: "substatus", Value: "Tell whether this server is subscribed to race/sprint reminders, and in which channel", Inline: false},
 				{Name: "help [title]", Value: "Shows this help message", Inline: false},
 			},
 			Footer: &EmbedFooter{Text: "franz-hermann bot"},
@@ -1789,6 +2151,36 @@ func main() {
 		msg := fmt.Sprintf("This server has been removed from subscriptions by <@%v>", m.Author.ID)
 		bot.SendMessage(m.ChannelID, msg)
 	}))
+
+	subStatus := func(m *gofluxer.Message, args []string) {
+		if m.GuildID == "" {
+			bot.SendMessage(m.ChannelID, "Run this in a server, not in DMs.")
+			return
+		}
+		sub, ok, err := getSubscription(m.GuildID)
+		if err != nil {
+			bot.SendMessage(m.ChannelID, "Database unavailable right now.")
+			return
+		}
+		if !ok {
+			bot.SendMessage(m.ChannelID, "This server is **not** subscribed. Run `>follow` in the channel that should get race reminders.")
+			return
+		}
+		last := "none yet"
+		if sub.LastSessionID != "" {
+			last = sub.LastSessionID
+			if races, rerr := getRaces(); rerr == nil {
+				if key, kerr := strconv.Atoi(sub.LastSessionID); kerr == nil {
+					if s, serr := getSessionFromKey(races, key); serr == nil {
+						last = fmt.Sprintf("%s (%s, %s)", s.SessionName, s.Location, s.DateStart.Format("02 Jan 2006"))
+					}
+				}
+			}
+		}
+		bot.SendMessage(m.ChannelID, fmt.Sprintf("This server **is** subscribed.\nChannel ID: `%s`\nSet by (user ID): `%s`\nLast reminder session: %s", sub.ChannelID, sub.InvokerUserID, last))
+	}
+	bot.AddCommand("substatus", asyncHandler(bot, subStatus))
+	bot.AddCommand("subscription", asyncHandler(bot, subStatus))
 
 	// Race reminder sender: check on startup and then every 5 minutes.
 	// getRaces() is cached (72h, or 35m while a race is underway), so

@@ -1,6 +1,6 @@
 # franz-hermann
 
-A Fluxer bot that shows F1 race info from the [OpenF1 API](https://api.openf1.org/):
+A Fluxer bot that shows F1 race info primarily from the [Jolpica API](https://api.jolpi.ca/ergast/f1/) (OpenF1 kept only as a cold-start fallback):
 countdown/race-day status in its presence, driver standings, last-race results,
 and driver lookups by car number.
 
@@ -16,13 +16,14 @@ All commands use the `>` prefix (e.g. `>who 1`).
 
 | Command | What it does |
 | --- | --- |
-| `>ping` | Live latency to Fluxer + OpenF1, plus CPU/memory usage. OpenF1 is probed at most once per 2 hours; pings in between report the cached value |
+| `>ping` | Live latency to Fluxer + Jolpica, plus CPU/memory usage. Jolpica is probed at most once per 30 minutes; pings in between report the cached value |
 | `>ds [title]` | Top 10 driver standings from the latest race session |
 | `>who <driver number>` | Driver name, team and country by car number (e.g. `>who 1`). Drivers without a headshot (e.g. reserve driver `#50`) just get no photo |
 | `>last [title]` | Top 10 results from the last race |
 | `>next [title]` | Next session with location, circuit, country and countdown |
 | `>follow` | Subscribe this channel to race/sprint reminders 30 minutes before start |
 | `>unfollow` | Unsubscribe this server from race/sprint reminders |
+| `>substatus` | Tell whether this server is subscribed to race/sprint reminders, and in which channel (alias: `>subscription`) |
 | `>help [title]` | Shows the help message |
 
 The bot also sets its presence to the next race countdown, or `🏁 RACE DAY at …`
@@ -79,19 +80,20 @@ go run .
 
 | File | Contents | Cache lifetime |
 | --- | --- | --- |
-| `data/race.json` | Race sessions for the season | 72 hours |
-| `data/drivers.json` | Drivers for the last race session | 480 hours (20 days) |
-| `data/standings.json` | Championship driver standings | 72 hours |
+| `data/race.json` | Race + Sprint sessions for the season | 12 hours (30 min while a race is underway) |
+| `data/sessions.json` | All sessions for the season | 12 hours (30 min while a race is underway) |
+| `data/drivers.json` | Drivers for the last race session | 72 hours |
+| `data/standings.json` | Championship driver standings | 6 hours (30 min right after a race), keyed by round |
 | `data/last-standings.json` | Last race session results | Until the next race (keyed by session) |
 
-All OpenF1 requests are bounded by a 10-second timeout, and command handlers run
+All API requests are bounded by a 10-second timeout, and command handlers run
 off the gateway loop with panic recovery, so a slow API can't freeze the bot.
 
 ## Project layout
 
 | File | Purpose |
 | --- | --- |
-| `main.go` | Bot, commands, OpenF1 fetching/caching, ping/resource probes |
+| `main.go` | Bot, commands, Jolpica fetching/caching (OpenF1 cold-start fallback), ping/resource probes |
 | `embeds.go` | Typed embed helpers (strips empty image/thumbnail URLs so embeds aren't rejected) |
 | `Dockerfile` / `docker-compose.yml` | Container build + deployment |
 | `data/` | Runtime JSON cache (see above) |
