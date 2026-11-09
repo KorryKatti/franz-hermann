@@ -1,9 +1,10 @@
 services:
   franz-hermann:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: franz-hermann:latest
+    # Public image built and pushed to GHCR by GitHub Actions
+    # (.github/workflows/docker.yml) on every push to main.
+    # The VM never builds: deploy with `docker compose pull && docker compose up -d`.
+    # Never add a `build:` section back or run `up --build` on the VM.
+    image: ghcr.io/korrykatti/franz-hermann:latest
     container_name: franz-hermann
     restart: unless-stopped
 

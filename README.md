@@ -45,25 +45,38 @@ Never commit `.env` — it's gitignored and excluded from the Docker build conte
 
 ### Docker (recommended)
 
+The image is built by GitHub Actions (`.github/workflows/docker.yml`) on every
+push to `main` and pushed to GHCR as a public image:
+`ghcr.io/korrykatti/franz-hermann:latest` (plus an immutable `:<commit-sha>`
+tag for rollback). The VM never builds — its RAM is too small for that.
+
+Deploy on the VM:
+
 ```bash
-docker compose up -d --build   # build + start detached
+cd ~/folk_bots/franz-hermann
+git pull                       # latest compose file
+# optional backup first: docker compose cp franz-hermann:/app/data ./data-backup-$(date +%F-%H%M)
+docker compose pull            # fetch the new prebuilt image
+docker compose up -d           # recreate the container
 docker compose logs -f         # follow logs
-docker compose down            # stop
+docker compose down            # stop (does NOT delete data — never use `down -v`)
 ```
 
 The compose service:
 
 - injects `BOT_TOKEN` from `.env` at runtime (`env_file`) — it's never baked into the image,
-- persists the JSON cache in `./data` (mounted to `/app/data`),
+- persists runtime data (JSON caches + `f1bot.db` subscriptions) in the named
+  volume `franz-data`, mounted at `/app/data`, so it survives image updates,
 - restarts automatically (`unless-stopped`),
 - exposes no ports — the bot only talks outbound (Gateway websocket + REST).
 
-The image is a multi-stage build (`golang:1.27-alpine` → `alpine:3.22`, ~28 MB)
-and runs as a non-root user.
+A failed Actions build changes nothing on the VM — the old image keeps running.
+To roll back, set `image:` in `docker-compose.yml` to a previous
+`ghcr.io/korrykatti/franz-hermann:<commit-sha>` tag and `docker compose up -d`.
 
-> If `./data` ends up owned by root (e.g. after running the bare binary as root),
-> the container can't write its cache. Fix with:
-> `sudo chown -R "$(id -u):$(id -g)" data/`
+The image is a multi-stage build (`golang:1.27-alpine` → `alpine:3.22`, ~28 MB)
+and runs as a non-root user. To build it manually (e.g. to test a change before
+pushing): `docker build -t franz-hermann:latest .`
 
 ### Locally
 
