@@ -1208,6 +1208,56 @@ type jolpiResultsResp struct {
 	} `json:"MRData"`
 }
 
+type jolpiSprintResultsResp struct {
+	MRData struct {
+		RaceTable struct {
+			Races []struct {
+				SprintResults []struct {
+					Number   string `json:"number"`
+					Position string `json:"position"`
+					Points   string `json:"points"`
+					Laps     string `json:"laps"`
+					Status   string `json:"status"`
+					Driver   struct {
+						PermanentNumber string `json:"permanentNumber"`
+					} `json:"Driver"`
+				} `json:"SprintResults"`
+			} `json:"Races"`
+		} `json:"RaceTable"`
+	} `json:"MRData"`
+}
+
+func fetchJolpiSprintResults(round int, sessionKey int) ([]sessionResult, error) {
+	url := "https://api.jolpi.ca/ergast/f1/" + strconv.Itoa(year) + "/" + strconv.Itoa(round) + "/sprint.json?limit=100"
+	resp, err := jolpiGet(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Jolpica returned status: %s", resp.Status)
+	}
+	var out jolpiSprintResultsResp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	var results []sessionResult
+	for _, race := range out.MRData.RaceTable.Races {
+		for _, r := range race.SprintResults {
+			num := atoi(r.Number)
+			if num == 0 {
+				num = atoi(r.Driver.PermanentNumber)
+			}
+			results = append(results, sessionResult{SessionKey: sessionKey, DriverNumber: num, Position: atoi(r.Position), Points: atof(r.Points), NumberOfLaps: atoi(r.Laps), DNF: r.Status == "Retired"})
+		}
+	}
+	if len(results) == 0 {
+		return nil, fmt.Errorf("Jolpica returned no results yet")
+	}
+	sort.Slice(results, func(i, j int) bool { return results[i].Position < results[j].Position })
+	return results, nil
+}
+
 func fetchJolpiResults(round int, sessionKey int) ([]sessionResult, error) {
 	url := "https://api.jolpi.ca/ergast/f1/" + strconv.Itoa(year) + "/" + strconv.Itoa(round) + "/results.json?limit=100"
 	resp, err := jolpiGet(url)
@@ -1535,6 +1585,14 @@ func initDB() error {
 	if err != nil {
 		return fmt.Errorf("failed to create subscription table: %w", err)
 	}
+	for _, q := range []string{
+		"ALTER TABLE subscriptions ADD COLUMN winner_last_session_id TEXT DEFAULT ''",
+		"ALTER TABLE subscriptions ADD COLUMN winner_sent INTEGER DEFAULT 0",
+	} {
+		if _, err := DB.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("failed to migrate subscriptions table: %w", err)
+		}
+	}
 	log.Println("database initzlised sccuesfuly")
 	return nil
 }
@@ -1560,26 +1618,28 @@ func addSubscription(serverID, channelID, userID string) error {
 }
 
 type Subscription struct {
-	ServerID      string
-	ChannelID     string
-	InvokerUserID string
-	LastSessionID string
-	Sent          bool
+	ServerID            string
+	ChannelID           string
+	InvokerUserID       string
+	LastSessionID       string
+	Sent                bool
+	WinnerLastSessionID string
+	WinnerSent          bool
 }
 
 func getSubscriptions() ([]Subscription, error) {
 	if DB == nil {
 		return nil, errors.New("database unavailable")
 	}
-	// COALESCE: fresh rows have NULL last_session_id, and scanning NULL
-	// into a string/bool fails, which would break every notification check.
 	rows, err := DB.Query(`
 	SELECT
 	server_id,
 	channel_id,
 	invoker_user_id,
 	COALESCE(last_session_id, ''),
-	COALESCE(sent, 0)
+	COALESCE(sent, 0),
+	COALESCE(winner_last_session_id, ''),
+	COALESCE(winner_sent, 0)
 	FROM subscriptions
 	`)
 	if err != nil {
@@ -1595,6 +1655,8 @@ func getSubscriptions() ([]Subscription, error) {
 			&sub.InvokerUserID,
 			&sub.LastSessionID,
 			&sub.Sent,
+			&sub.WinnerLastSessionID,
+			&sub.WinnerSent,
 		)
 		if err != nil {
 			return nil, err
@@ -1612,9 +1674,9 @@ func getSubscription(serverID string) (Subscription, bool, error) {
 	if DB == nil {
 		return Subscription{}, false, errors.New("database unavailable")
 	}
-	row := DB.QueryRow(`SELECT server_id, channel_id, invoker_user_id, COALESCE(last_session_id, ''), COALESCE(sent, 0) FROM subscriptions WHERE server_id = ?`, serverID)
+	row := DB.QueryRow(`SELECT server_id, channel_id, invoker_user_id, COALESCE(last_session_id, ''), COALESCE(sent, 0), COALESCE(winner_last_session_id, ''), COALESCE(winner_sent, 0) FROM subscriptions WHERE server_id = ?`, serverID)
 	var sub Subscription
-	err := row.Scan(&sub.ServerID, &sub.ChannelID, &sub.InvokerUserID, &sub.LastSessionID, &sub.Sent)
+	err := row.Scan(&sub.ServerID, &sub.ChannelID, &sub.InvokerUserID, &sub.LastSessionID, &sub.Sent, &sub.WinnerLastSessionID, &sub.WinnerSent)
 	if err == sql.ErrNoRows {
 		return Subscription{}, false, nil
 	}
@@ -1703,6 +1765,206 @@ func updateNotification(server_id string, session_id string) error {
 
 	_, err := DB.Exec(query, session_id, server_id)
 	return err
+}
+
+type driversGifData struct {
+	Drivers   map[string]string `json:"drivers"`
+	Fallbacks []string          `json:"fallbacks"`
+}
+
+func loadDriversGif() driversGifData {
+	data, err := os.ReadFile("drivers_gif.json")
+	if err != nil {
+		return driversGifData{}
+	}
+	var out driversGifData
+	if err := json.Unmarshal(data, &out); err != nil {
+		return driversGifData{}
+	}
+	return out
+}
+
+func winnerGifURL(acronym string) string {
+	g := loadDriversGif()
+	if url, ok := g.Drivers[acronym]; ok && url != "" {
+		return url
+	}
+	if len(g.Fallbacks) > 0 {
+		return g.Fallbacks[0]
+	}
+	return ""
+}
+
+func fetchSessionResults(session Session) ([]sessionResult, error) {
+	var results []sessionResult
+	var err error
+	if session.SessionName == "Sprint" {
+		results, err = fetchJolpiSprintResults(session.Round, session.SessionKey)
+	} else {
+		results, err = fetchJolpiResults(session.Round, session.SessionKey)
+		if err == nil {
+			sort.Slice(results, func(i, j int) bool { return results[i].Position < results[j].Position })
+		}
+	}
+	return results, err
+}
+
+func getTop3ForSession(session Session) ([]driverStandings, []string, error) {
+	results, err := fetchSessionResults(session)
+	if err != nil || len(results) == 0 {
+		if err == nil {
+			err = fmt.Errorf("no results")
+		}
+		return nil, nil, err
+	}
+	standings := mapSessionResults(results)
+	if len(standings) > 3 {
+		standings = standings[:3]
+	}
+	acronyms := make([]string, len(standings))
+	for i, d := range standings {
+		if dr, err := getDriverName(d.DriverNumber); err == nil {
+			acronyms[i] = dr.NameAcronym
+		}
+	}
+	return standings, acronyms, nil
+}
+
+func createWinnerEmbed(session Session, top3 []driverStandings, acronyms []string) Embed {
+	label := session.SessionName
+	if label == "" {
+		label = "Race"
+	}
+	title := fmt.Sprintf("🏆 %s Results: %s", label, session.Location)
+	if session.Location == "" {
+		title = fmt.Sprintf("🏆 %s Results", label)
+	}
+	lines := []string{}
+	for i, d := range top3 {
+		name := fmt.Sprintf("#%d", d.DriverNumber)
+		if dr, err := getDriverName(d.DriverNumber); err == nil {
+			if dr.FullName != "" {
+				name = dr.FullName
+			} else if dr.NameAcronym != "" {
+				name = dr.NameAcronym
+			}
+		}
+		team := ""
+		if dr, err := getDriverName(d.DriverNumber); err == nil && dr.TeamName != "" {
+			team = " — " + dr.TeamName
+		}
+		lines = append(lines, fmt.Sprintf("**P%d** %s%s", i+1, name, team))
+	}
+	img := ""
+	if len(acronyms) > 0 {
+		img = winnerGifURL(acronyms[0])
+	}
+	embed := Embed{
+		Title:       title,
+		URL:         siteURL,
+		Description: strings.Join(lines, "\n"),
+		Color:       0xE10600,
+		Footer:      &EmbedFooter{Text: "franz-hermann"},
+	}
+	if img != "" {
+		embed.Image = &EmbedImage{URL: img}
+	}
+	return embed
+}
+
+func updateWinnerNotification(serverID, sessionID string, sent bool) error {
+	if DB == nil {
+		return errors.New("database unavailable")
+	}
+	_, err := DB.Exec(`
+	UPDATE subscriptions
+	SET winner_last_session_id = ?,
+		winner_sent = ?,
+		last_updated = CURRENT_TIMESTAMP
+	WHERE server_id = ?
+	`, sessionID, sent, serverID)
+	return err
+}
+
+func findWinnerSession(sessions []Session) *Session {
+	now := time.Now()
+	var candidate *Session
+	for i := range sessions {
+		s := &sessions[i]
+		if s.IsCancelled {
+			continue
+		}
+		if s.SessionName != "Race" && s.SessionName != "Sprint" {
+			continue
+		}
+		if now.Before(s.DateEnd.Add(30 * time.Minute)) {
+			continue
+		}
+		if candidate == nil || s.DateEnd.After(candidate.DateEnd) {
+			candidate = s
+		}
+	}
+	return candidate
+}
+
+func checkWinnerNotifications(bot *gofluxer.Bot, sessions []Session) {
+	session := findWinnerSession(sessions)
+	if session == nil {
+		return
+	}
+	sessionID := fmt.Sprint(session.SessionKey)
+	now := time.Now()
+	windowOpen := !now.Before(session.DateEnd.Add(30 * time.Minute))
+	windowClosed := !now.Before(session.DateEnd.Add(90 * time.Minute))
+
+	subs, err := getSubscriptions()
+	if err != nil {
+		log.Printf("Failed to get subscriptions for winner: %v", err)
+		return
+	}
+
+	if windowClosed {
+		for _, sub := range subs {
+			if sub.WinnerLastSessionID != sessionID {
+				_ = updateWinnerNotification(sub.ServerID, sessionID, false)
+			}
+		}
+		return
+	}
+	if !windowOpen {
+		return
+	}
+
+	needs := false
+	for _, sub := range subs {
+		if sub.WinnerLastSessionID != sessionID || !sub.WinnerSent {
+			needs = true
+			break
+		}
+	}
+	if !needs {
+		return
+	}
+
+	top3, acronyms, err := getTop3ForSession(*session)
+	if err != nil {
+		return
+	}
+	embed := createWinnerEmbed(*session, top3, acronyms)
+	for _, sub := range subs {
+		if sub.WinnerLastSessionID == sessionID && sub.WinnerSent {
+			continue
+		}
+		if sub.WinnerLastSessionID != sessionID {
+			if err := updateWinnerNotification(sub.ServerID, sessionID, false); err != nil {
+				log.Printf("Failed to init winner notification: %v", err)
+			}
+		}
+		SendEmbed(bot, sub.ChannelID, embed)
+		if err := updateWinnerNotification(sub.ServerID, sessionID, true); err != nil {
+			log.Printf("Failed to update winner notification: %v", err)
+		}
+	}
 }
 
 func createRaceEmbed(session Session) Embed {
