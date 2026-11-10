@@ -1815,20 +1815,9 @@ func main() {
 
 			log.Println("Status:", status)
 
-			if bot.Conn == nil {
-				log.Println("Presence skipped: no gateway connection")
-				return
-			}
-			err := bot.Conn.WriteJSON(map[string]any{
-				"op": 3,
-				"d": map[string]any{
-					"status": "online",
-					"afk":    false,
-					"custom_status": map[string]any{
-						"text":     status,
-						"emoji_id": 1567114760195936256,
-					},
-				},
+			err := bot.SetStatus("online", &gofluxer.CustomStatus{
+				Text:   status,
+				EmojiID: "1567114760195936256",
 			})
 
 			if err != nil {
@@ -2187,7 +2176,23 @@ func main() {
 		})
 	}))
 
+canManageFollow := func(m *gofluxer.Message) bool {
+	if m.GuildID == "" {
+		return false
+	}
+	if bot.IsOwner(m) {
+		return true
+	}
+	return bot.HasPermission(m, gofluxer.PermissionManageChannels) ||
+		bot.HasPermission(m, gofluxer.PermissionManageMessages) ||
+		bot.HasPermission(m, gofluxer.PermissionManageEvents)
+}
+
 	bot.AddCommand("follow", asyncHandler(bot, func(m *gofluxer.Message, args []string) {
+		if !canManageFollow(m) {
+			bot.SendMessage(m.ChannelID, "You need Manage Channels, Manage Messages, Manage Events, or be the server owner to use this command.")
+			return
+		}
 		serverID := m.GuildID
 		channelID := m.ChannelID
 		invokerID := m.Author.ID
@@ -2208,6 +2213,10 @@ func main() {
 	}))
 
 	bot.AddCommand("unfollow", asyncHandler(bot, func(m *gofluxer.Message, args []string) {
+		if !canManageFollow(m) {
+			bot.SendMessage(m.ChannelID, "You need Manage Channels, Manage Messages, Manage Events, or be the server owner to use this command.")
+			return
+		}
 		server_id := m.GuildID
 
 		err := removeSubscription(server_id)
