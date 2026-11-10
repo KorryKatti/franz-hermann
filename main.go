@@ -1911,6 +1911,9 @@ func main() {
 				{Name: "unfollow", Value: "Unsubscribe this server from race/sprint reminders", Inline: false},
 				{Name: "substatus", Value: "Tell whether this server is subscribed to race/sprint reminders, and in which channel", Inline: false},
 				{Name: "help [title]", Value: "Shows this help message", Inline: false},
+				{Name: "Invite", Value: "[Add to server](https://fluxer.com/oauth2/authorize?client_id=1566837767571247107&scope=bot&permissions=274878171200)", Inline: true},
+				{Name: "Support", Value: "[Join server](https://fluxer.gg/s1evrala)", Inline: true},
+				{Name: "Website", Value: "[korrykatti.github.io](https://korrykatti.github.io/franz-hermann)", Inline: true},
 			},
 			Footer: &EmbedFooter{Text: "franz-hermann bot"},
 		})
