@@ -87,7 +87,7 @@ var startTime = time.Now()
 const pingTTL = 30 * time.Minute
 
 // siteURL is the bot's page, linked from every embed's title.
-const siteURL = "https://korrykatti.github.io/franz-hermann"
+const siteURL = "https://korrykatti.github.io/projects/franz-hermann/"
 
 type pingCache struct {
 	mu        sync.Mutex
@@ -309,6 +309,7 @@ var raceUnderway atomic.Bool
 var lastRaceFetchMu sync.Mutex
 var lastRaceFetch time.Time
 var lastStandingsFetch time.Time
+var lastConstructorStandingsFetch time.Time
 var lastDriversFetch time.Time
 var lastNextFetch time.Time
 
@@ -677,6 +678,18 @@ type driverStandingCache struct {
 	Standings []driverStandings `json:"standings"`
 }
 
+type constructorStanding struct {
+	Position int     `json:"position"`
+	Points   float64 `json:"points"`
+	Name     string  `json:"name"`
+}
+
+type constructorStandingCache struct {
+	UpdatedAt time.Time             `json:"updated_at"`
+	Round     int                   `json:"round"`
+	Standings []constructorStanding `json:"standings"`
+}
+
 func getSessionKey(races []Session, which string) int {
 	// possible thigs in which is prev and curr , if prev return prev session id and if curr return today's session id and if not found default to prev
 	now := time.Now().UTC()
@@ -1002,6 +1015,51 @@ func fetchJolpiStandings(round int, sessionKey int) ([]driverStandings, map[int]
 	return standings, teams, nil
 }
 
+type jolpiConstructorStandingsResp struct {
+	MRData struct {
+		StandingsTable struct {
+			StandingsLists []struct {
+				ConstructorStandings []struct {
+					Position    string `json:"position"`
+					Points      string `json:"points"`
+					Constructor struct {
+						Name string `json:"name"`
+					} `json:"Constructor"`
+				} `json:"ConstructorStandings"`
+			} `json:"StandingsLists"`
+		} `json:"StandingsTable"`
+	} `json:"MRData"`
+}
+
+func fetchJolpiConstructorStandings(round int) ([]constructorStanding, error) {
+	url := "https://api.jolpi.ca/ergast/f1/" + strconv.Itoa(year) + "/" + strconv.Itoa(round) + "/constructorstandings.json?limit=100"
+	resp, err := jolpiGet(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Jolpica returned status: %s", resp.Status)
+	}
+	var out jolpiConstructorStandingsResp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	var standings []constructorStanding
+	for _, list := range out.MRData.StandingsTable.StandingsLists {
+		for _, c := range list.ConstructorStandings {
+			standings = append(standings, constructorStanding{Position: atoi(c.Position), Points: atof(c.Points), Name: c.Constructor.Name})
+		}
+		if len(standings) > 0 {
+			break
+		}
+	}
+	if len(standings) == 0 {
+		return nil, fmt.Errorf("Jolpica returned no constructor standings")
+	}
+	return standings, nil
+}
+
 func getDriverStandings() ([]driverStandings, error) {
 	standingsTTL := 6 * time.Hour
 	cooldown := 30 * time.Minute
@@ -1104,6 +1162,80 @@ func getDriverStandings() ([]driverStandings, error) {
 		standings = standings[:10]
 	}
 	return standings, nil
+}
+
+func getConstructorStandings() ([]constructorStanding, error) {
+	standingsTTL := 6 * time.Hour
+	cooldown := 30 * time.Minute
+	if raceUnderway.Load() {
+		standingsTTL = 30 * time.Minute
+		cooldown = 15 * time.Minute
+	}
+	var stale []constructorStanding
+	var staleRound int
+	var staleUpdated time.Time
+	data, err := os.ReadFile("data/team_standings.json")
+	if err == nil {
+		var cache constructorStandingCache
+		if json.Unmarshal(data, &cache) == nil && len(cache.Standings) > 0 {
+			stale = cache.Standings
+			staleRound = cache.Round
+			staleUpdated = cache.UpdatedAt
+		}
+	}
+	staleTop10 := func() []constructorStanding {
+		if len(stale) > 10 {
+			return stale[:10]
+		}
+		return stale
+	}
+	races, err := getRaces()
+	if err != nil {
+		if len(stale) > 0 {
+			return staleTop10(), nil
+		}
+		return nil, fmt.Errorf("loading races: %w", err)
+	}
+	session_key := getSessionKey(races, "prev")
+	if session_key == 0 {
+		if len(stale) > 0 {
+			return staleTop10(), nil
+		}
+		return nil, fmt.Errorf("no completed race found (session_key=0)")
+	}
+	prev, _ := getSessionFromKey(races, session_key)
+	if len(stale) > 0 && staleRound == prev.Round && staleRound != 0 && !staleUpdated.IsZero() && time.Since(staleUpdated) < standingsTTL {
+		return staleTop10(), nil
+	}
+	if len(stale) > 0 && !lastConstructorStandingsFetch.IsZero() && time.Since(lastConstructorStandingsFetch) < cooldown {
+		return staleTop10(), nil
+	}
+	lastConstructorStandingsFetch = time.Now()
+	if prev.Round > 0 {
+		standings, ferr := fetchJolpiConstructorStandings(prev.Round)
+		if ferr == nil && len(standings) > 0 {
+			os.MkdirAll("data", 0755)
+			cache := constructorStandingCache{UpdatedAt: time.Now().UTC(), Round: prev.Round, Standings: standings}
+			data, _ := json.MarshalIndent(cache, "", "  ")
+			if err := writeCacheFile("data/team_standings.json", data); err != nil {
+				return nil, err
+			}
+			if len(standings) > 10 {
+				standings = standings[:10]
+			}
+			return standings, nil
+		}
+		if len(stale) > 0 {
+			return staleTop10(), nil
+		}
+		if raceUnderway.Load() {
+			return nil, fmt.Errorf("Jolpica standings unavailable during live session")
+		}
+	}
+	if len(stale) > 0 {
+		return staleTop10(), nil
+	}
+	return nil, fmt.Errorf("no constructor standings available")
 }
 
 func getSessionFromKey(sessions []Session, key int) (Session, error) {
@@ -1433,7 +1565,7 @@ func findNextSession(sessions []allSession) *allSession {
 	return next
 }
 
-func getNextSession() (*allSession, error) {
+func getAllSessions() ([]allSession, error) {
 	nextTTL := 12 * time.Hour
 	cooldown := 30 * time.Minute
 	if raceUnderway.Load() {
@@ -1447,12 +1579,12 @@ func getNextSession() (*allSession, error) {
 		if json.Unmarshal(data, &cache) == nil && len(cache.AllSessions) > 0 {
 			stale = cache.AllSessions
 			if !cache.UpdatedAt.IsZero() && time.Since(cache.UpdatedAt) < nextTTL {
-				return findNextSession(cache.AllSessions), nil
+				return cache.AllSessions, nil
 			}
 		}
 	}
 	if len(stale) > 0 && !lastNextFetch.IsZero() && time.Since(lastNextFetch) < cooldown {
-		return findNextSession(stale), nil
+		return stale, nil
 	}
 	lastNextFetch = time.Now()
 	if schedule, ferr := fetchJolpiSchedule(); ferr == nil {
@@ -1467,10 +1599,10 @@ func getNextSession() (*allSession, error) {
 			if err := writeCacheFile("data/sessions.json", cacheData); err != nil {
 				return nil, err
 			}
-			return findNextSession(all), nil
+			return all, nil
 		}
 	} else if len(stale) > 0 {
-		return findNextSession(stale), nil
+		return stale, nil
 	}
 	if raceUnderway.Load() {
 		return nil, fmt.Errorf("Jolpica schedule unavailable during live session")
@@ -1479,29 +1611,28 @@ func getNextSession() (*allSession, error) {
 	resp, err := httpClient.Get(url)
 	if err != nil {
 		if len(stale) > 0 {
-			return findNextSession(stale), nil
+			return stale, nil
 		}
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		if len(stale) > 0 {
-			return findNextSession(stale), nil
+			return stale, nil
 		}
 		return nil, fmt.Errorf("OpenF1 returned status: %s", resp.Status)
 	}
 	var all_sessions []allSession
 	if err := json.NewDecoder(resp.Body).Decode(&all_sessions); err != nil {
 		if len(stale) > 0 {
-			return findNextSession(stale), nil
+			return stale, nil
 		}
 		return nil, fmt.Errorf("decoding driver names: %w", err)
 	}
 	if err := os.MkdirAll("data", 0755); err != nil {
 		return nil, err
 	}
-	var cache allSessionCache
-	cache = allSessionCache{UpdatedAt: time.Now().UTC(), AllSessions: all_sessions}
+	cache := allSessionCache{UpdatedAt: time.Now().UTC(), AllSessions: all_sessions}
 	cacheData, err := json.MarshalIndent(cache, "", "  ")
 	if err != nil {
 		return nil, err
@@ -1509,7 +1640,43 @@ func getNextSession() (*allSession, error) {
 	if err := writeCacheFile("data/sessions.json", cacheData); err != nil {
 		return nil, err
 	}
-	return findNextSession(all_sessions), nil
+	return all_sessions, nil
+}
+
+func getNextSession() (*allSession, error) {
+	sessions, err := getAllSessions()
+	if err != nil {
+		return nil, err
+	}
+	return findNextSession(sessions), nil
+}
+
+func findTrackSession(sessions []allSession, arg string) *allSession {
+	if arg == "" || strings.EqualFold(arg, "next") {
+		return findNextSession(sessions)
+	}
+	round, err := strconv.Atoi(arg)
+	if err != nil || round <= 0 {
+		return nil
+	}
+	var race *allSession
+	var first *allSession
+	for i := range sessions {
+		s := &sessions[i]
+		if s.Round != round || s.IsCancelled {
+			continue
+		}
+		if first == nil || s.DateStart.Before(first.DateStart) {
+			first = s
+		}
+		if s.SessionType == "Race" || s.SessionName == "Race" {
+			race = s
+		}
+	}
+	if race != nil {
+		return race
+	}
+	return first
 }
 
 func migrateSessionIDs() {
@@ -2166,16 +2333,18 @@ func main() {
 			Fields: []EmbedField{
 				{Name: "ping", Value: "Live latency to Fluxer + Jolpica (Jolpica probed at most once per 30m), plus CPU/memory usage", Inline: false},
 				{Name: "ds [title]", Value: "Top 10 driver standings from the latest race session", Inline: false},
+				{Name: "ts [title]", Value: "Top 10 constructor standings from the latest race session", Inline: false},
 				{Name: "who <driver number>", Value: "Driver name, team and country by car number (e.g. `>who 1`)", Inline: false},
 				{Name: "last [title]", Value: "Top 10 results from the last race", Inline: false},
 				{Name: "next [title]", Value: "Next session with location, circuit, country and countdown", Inline: false},
+				{Name: "track [round|next]", Value: "Circuit/location info for a round (defaults to next upcoming)", Inline: false},
 				{Name: "follow", Value: "Subscribe this channel to race/sprint reminders 30 minutes before start", Inline: false},
 				{Name: "unfollow", Value: "Unsubscribe this server from race/sprint reminders", Inline: false},
 				{Name: "substatus", Value: "Tell whether this server is subscribed to race/sprint reminders, and in which channel", Inline: false},
 				{Name: "help [title]", Value: "Shows this help message", Inline: false},
 				{Name: "Invite", Value: "[Add to server](https://fluxer.com/oauth2/authorize?client_id=1566837767571247107&scope=bot&permissions=274878171200)", Inline: true},
 				{Name: "Support", Value: "[Join server](https://fluxer.gg/s1evrala)", Inline: true},
-				{Name: "Website", Value: "[korrykatti.github.io](https://korrykatti.github.io/franz-hermann)", Inline: true},
+				{Name: "Website", Value: "[korrykatti.github.io](https://korrykatti.github.io/projects/franz-hermann/)", Inline: true},
 			},
 			Footer: &EmbedFooter{Text: "franz-hermann bot"},
 		})
@@ -2217,6 +2386,40 @@ func main() {
 			Title:       title,
 			URL:         siteURL,
 			Description: "Driver standings from latest race session",
+			Color:       0x584F99,
+			Fields:      fields,
+		})
+	}))
+
+	bot.AddCommand("ts", asyncHandler(bot, func(m *gofluxer.Message, args []string) {
+		title := "Top 10 Constructor Leaderboard"
+		if len(args) > 0 {
+			title = strings.Join(args, " ")
+		}
+
+		standings, err := getConstructorStandings()
+		if err != nil {
+			bot.SendMessage(m.ChannelID, "Failed to fetch team standings: "+err.Error())
+			return
+		}
+		if len(standings) == 0 {
+			bot.SendMessage(m.ChannelID, "No team standings available right now.")
+			return
+		}
+
+		fields := make([]EmbedField, 0, len(standings))
+		for _, t := range standings {
+			fields = append(fields, EmbedField{
+				Name:   t.Name,
+				Value:  fmt.Sprintf("%.1f pts (P%d)", t.Points, t.Position),
+				Inline: true,
+			})
+		}
+
+		SendEmbed(bot, m.ChannelID, Embed{
+			Title:       title,
+			URL:         siteURL,
+			Description: "Constructor standings from latest race session",
 			Color:       0x584F99,
 			Fields:      fields,
 		})
@@ -2394,9 +2597,6 @@ func main() {
 
 		timestamp := next.DateStart.Unix()
 
-		// next.Location / CircuitShortName / CountryName / SessionType are
-		// already in the OpenF1 payload (see allSession) — the old embed
-		// just never printed them, only SessionName + start time.
 		sessionLabel := next.SessionName
 		if next.SessionType != "" {
 			sessionLabel = fmt.Sprintf("%s (%s)", next.SessionName, next.SessionType)
@@ -2412,8 +2612,6 @@ func main() {
 			timestamp,
 		)
 
-		// Fall back so the embed never shows a blank field when OpenF1
-		// omits one of these for a session.
 		orUnknown := func(s string) string {
 			if s == "" {
 				return "—"
@@ -2441,7 +2639,96 @@ func main() {
 		})
 	}))
 
-canManageFollow := func(m *gofluxer.Message) bool {
+	bot.AddCommand("track", asyncHandler(bot, func(m *gofluxer.Message, args []string) {
+		arg := ""
+		if len(args) > 0 {
+			arg = args[0]
+		}
+
+		sessions, err := getAllSessions()
+		if err != nil {
+			bot.SendMessage(m.ChannelID, "Failed to fetch track info: "+err.Error())
+			return
+		}
+
+		track := findTrackSession(sessions, arg)
+		if track == nil {
+			if arg == "" || strings.EqualFold(arg, "next") {
+				bot.SendMessage(m.ChannelID, "No upcoming track found.")
+			} else {
+				bot.SendMessage(m.ChannelID, "No track found for round "+arg+".")
+			}
+			return
+		}
+
+		circuit := track.CircuitShortName
+		if circuit == "" {
+			circuit = track.Location
+		}
+		if circuit == "" {
+			circuit = "Unknown"
+		}
+		location := track.Location
+		if location == "" {
+			location = "Unknown"
+		}
+		country := track.CountryName
+		if country == "" {
+			country = track.CountryCode
+		}
+		if country == "" {
+			country = "Unknown"
+		}
+
+		title := fmt.Sprintf("Round %d — %s", track.Round, circuit)
+		if track.Round == 0 {
+			title = circuit
+		}
+
+		fields := []EmbedField{
+			{Name: "Circuit", Value: circuit, Inline: true},
+			{Name: "Location", Value: location, Inline: true},
+			{Name: "Country", Value: country, Inline: true},
+		}
+		if track.Round != 0 || track.Year != 0 {
+			roundVal := fmt.Sprintf("%d", track.Round)
+			if track.Year != 0 {
+				roundVal = fmt.Sprintf("%d (%d)", track.Round, track.Year)
+			}
+			fields = append(fields, EmbedField{Name: "Round", Value: roundVal, Inline: true})
+		}
+
+		desc := fmt.Sprintf("%s, %s", location, country)
+		if !track.DateStart.IsZero() {
+			ts := track.DateStart.Unix()
+			sessionLabel := track.SessionName
+			if sessionLabel == "" {
+				sessionLabel = track.SessionType
+			}
+			if sessionLabel == "" {
+				sessionLabel = "Session"
+			}
+			when := fmt.Sprintf("<t:%d:F>\n<t:%d:R>", ts, ts)
+			if track.DateEnd.Before(time.Now().UTC()) {
+				when = fmt.Sprintf("<t:%d:F>", ts)
+			}
+			fields = append(fields, EmbedField{Name: "Session (" + sessionLabel + ")", Value: when, Inline: false})
+			if track.DateEnd.After(time.Now().UTC()) {
+				desc = fmt.Sprintf("%s, %s", location, country)
+			}
+		}
+
+		SendEmbed(bot, m.ChannelID, Embed{
+			Title:       title,
+			URL:         siteURL,
+			Description: desc,
+			Color:       0x5865F2,
+			Fields:      fields,
+			Footer:      &EmbedFooter{Text: "franz-hermann bot"},
+		})
+	}))
+
+	canManageFollow := func(m *gofluxer.Message) bool {
 	if m.GuildID == "" {
 		return false
 	}

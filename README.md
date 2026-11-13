@@ -1,7 +1,7 @@
 # franz-hermann
 
 A Fluxer bot that shows F1 race info primarily from the [Jolpica API](https://api.jolpi.ca/ergast/f1/) (OpenF1 kept only as a cold-start fallback):
-countdown/race-day status in its presence, driver standings, last-race results,
+countdown/race-day status in its presence, driver and constructor standings, last-race results,
 and driver lookups by car number.
 
 Built with Go + [gofluxer](https://github.com/go-fluxer/gofluxer).
@@ -18,9 +18,11 @@ All commands use the `>` prefix (e.g. `>who 1`).
 | --- | --- |
 | `>ping` | Live latency to Fluxer + Jolpica, plus CPU/memory usage. Jolpica is probed at most once per 30 minutes; pings in between report the cached value |
 | `>ds [title]` | Top 10 driver standings from the latest race session |
+| `>ts [title]` | Top 10 constructor standings from the latest race session |
 | `>who <driver number>` | Driver name, team, country, date of birth and Wikipedia link by car number (e.g. `>who 1`) |
 | `>last [title]` | Top 10 results from the last race |
 | `>next [title]` | Next session with location, circuit, country and countdown |
+| `>track [round\|next]` | Circuit/location info for a round (defaults to next upcoming) |
 | `>follow` | Subscribe this channel to race/sprint reminders 30 minutes before start |
 | `>unfollow` | Unsubscribe this server from race/sprint reminders |
 | `>substatus` | Tell whether this server is subscribed to race/sprint reminders, and in which channel (alias: `>subscription`) |
@@ -97,6 +99,7 @@ go run .
 | `data/sessions.json` | All sessions for the season | 12 hours (30 min while a race is underway) |
 | `data/drivers.json` | Drivers for the last race session | 72 hours |
 | `data/standings.json` | Championship driver standings | 6 hours (30 min right after a race), keyed by round |
+| `data/team_standings.json` | Championship constructor standings | 6 hours (30 min right after a race), keyed by round |
 | `data/last-standings.json` | Last race session results | Until the next race (keyed by session) |
 
 All API requests are bounded by a 10-second timeout, and command handlers run
