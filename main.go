@@ -1962,6 +1962,61 @@ func winnerGifURL(acronym string) string {
 	return ""
 }
 
+func findOpenF1SessionKey(session Session) (int, error) {
+	url := fmt.Sprintf("https://api.openf1.org/v1/sessions?year=%d&session_name=%s", session.Year, session.SessionName)
+	resp, err := httpClient.Get(url)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("OpenF1 sessions returned status: %s", resp.Status)
+	}
+	var sessions []struct {
+		SessionKey int       `json:"session_key"`
+		DateStart  time.Time `json:"date_start"`
+		Location   string    `json:"location"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&sessions); err != nil {
+		return 0, err
+	}
+	for _, s := range sessions {
+		if !session.DateStart.IsZero() && s.DateStart.Equal(session.DateStart) {
+			return s.SessionKey, nil
+		}
+	}
+	for _, s := range sessions {
+		if session.Location != "" && strings.EqualFold(s.Location, session.Location) {
+			return s.SessionKey, nil
+		}
+	}
+	return 0, fmt.Errorf("no OpenF1 session found for %s %s", session.SessionName, session.Location)
+}
+
+func fetchOpenF1SessionResults(session Session) ([]sessionResult, error) {
+	key, err := findOpenF1SessionKey(session)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := httpClient.Get(fmt.Sprintf("https://api.openf1.org/v1/session_result?session_key=%d&position%%3C=10", key))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("OpenF1 session_result returned status: %s", resp.Status)
+	}
+	var results []sessionResult
+	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return nil, fmt.Errorf("OpenF1 returned no results yet")
+	}
+	sort.Slice(results, func(i, j int) bool { return results[i].Position < results[j].Position })
+	return results, nil
+}
+
 func fetchSessionResults(session Session) ([]sessionResult, error) {
 	var results []sessionResult
 	var err error
@@ -1971,6 +2026,15 @@ func fetchSessionResults(session Session) ([]sessionResult, error) {
 		results, err = fetchJolpiResults(session.Round, session.SessionKey)
 		if err == nil {
 			sort.Slice(results, func(i, j int) bool { return results[i].Position < results[j].Position })
+		}
+	}
+	if err != nil || len(results) == 0 {
+		ofResults, ofErr := fetchOpenF1SessionResults(session)
+		if ofErr == nil && len(ofResults) > 0 {
+			return ofResults, nil
+		}
+		if err == nil {
+			err = fmt.Errorf("no results")
 		}
 	}
 	return results, err
