@@ -30,6 +30,7 @@ RUN apk add --no-cache ca-certificates tzdata \
 WORKDIR /app
 
 COPY --from=builder /out/franz-hermann ./franz-hermann
+COPY --from=builder /src/drivers_gif.json ./drivers_gif.json
 
 # data/ is a writable cache dir (race.json, standings.json, ...).
 # In compose it is persisted via a volume, so chown survives.
