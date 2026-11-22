@@ -1,7 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
 
 	"github.com/go-fluxer/gofluxer"
 )
@@ -49,9 +54,9 @@ func (e Embed) ToMap() map[string]interface{} {
 	return m
 }
 
-// SendEmbed sends a typed Embed.
-func SendEmbed(bot *gofluxer.Bot, channelID string, e Embed) {
-	// gofluxer swallows send errors, so an invalid embed fails silently.
+// SendEmbed posts a typed Embed and returns an error if Fluxer rejects it.
+// gofluxer's helper returns nothing, so delivery failures were invisible.
+func SendEmbed(bot *gofluxer.Bot, channelID string, e Embed) error {
 	// Drop empty image/thumbnail URLs — "thumbnail":{"url":""} makes
 	// the API reject the whole embed (this is what silenced `who 50`).
 	if e.Thumbnail != nil && e.Thumbnail.URL == "" {
@@ -60,5 +65,35 @@ func SendEmbed(bot *gofluxer.Bot, channelID string, e Embed) {
 	if e.Image != nil && e.Image.URL == "" {
 		e.Image = nil
 	}
-	bot.SendEmbed(channelID, e.ToMap())
+
+	payload, err := json.Marshal(map[string]interface{}{
+		"embeds": []interface{}{e.ToMap()},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal embed: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/channels/%s/messages", bot.BaseURL, channelID)
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("build embed request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bot "+bot.Token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("send embed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		detail := strings.TrimSpace(string(body))
+		if detail == "" {
+			return fmt.Errorf("send embed: fluxer returned %s", resp.Status)
+		}
+		return fmt.Errorf("send embed: fluxer returned %s: %s", resp.Status, detail)
+	}
+	return nil
 }

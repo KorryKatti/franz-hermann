@@ -71,7 +71,7 @@ func asyncHandler(bot *gofluxer.Bot, fn func(m *gofluxer.Message, args []string)
 			defer func() { <-commandSem }()
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("panic in command handler: %v", r)
+					reportError(bot, "command panic", fmt.Errorf("%v", r), "guild", m.GuildID, "channel", m.ChannelID)
 					bot.SendMessage(m.ChannelID, "Something went wrong handling that command.")
 				}
 			}()
@@ -2074,31 +2074,22 @@ func findWinnerSession(sessions []Session) *Session {
 	return candidate
 }
 
+const winnerDeliveryWindow = 48 * time.Hour
+
 func checkWinnerNotifications(bot *gofluxer.Bot, sessions []Session) {
 	session := findWinnerSession(sessions)
 	if session == nil {
 		return
 	}
+	if !time.Now().Before(session.DateEnd.Add(winnerDeliveryWindow)) {
+		return
+	}
+
 	sessionID := fmt.Sprint(session.SessionKey)
-	now := time.Now()
-	windowOpen := !now.Before(session.DateEnd.Add(30 * time.Minute))
-	windowClosed := !now.Before(session.DateEnd.Add(90 * time.Minute))
 
 	subs, err := getSubscriptions()
 	if err != nil {
-		log.Printf("Failed to get subscriptions for winner: %v", err)
-		return
-	}
-
-	if windowClosed {
-		for _, sub := range subs {
-			if sub.WinnerLastSessionID != sessionID {
-				_ = updateWinnerNotification(sub.ServerID, sessionID, false)
-			}
-		}
-		return
-	}
-	if !windowOpen {
+		reportError(bot, "winner subscriptions", err)
 		return
 	}
 
@@ -2115,6 +2106,7 @@ func checkWinnerNotifications(bot *gofluxer.Bot, sessions []Session) {
 
 	top3, acronyms, err := getTop3ForSession(*session)
 	if err != nil {
+		log.Printf("Winner results not ready for %s: %v", session.Location, err)
 		return
 	}
 	embed := createWinnerEmbed(*session, top3, acronyms)
@@ -2122,14 +2114,13 @@ func checkWinnerNotifications(bot *gofluxer.Bot, sessions []Session) {
 		if sub.WinnerLastSessionID == sessionID && sub.WinnerSent {
 			continue
 		}
-		if sub.WinnerLastSessionID != sessionID {
-			if err := updateWinnerNotification(sub.ServerID, sessionID, false); err != nil {
-				log.Printf("Failed to init winner notification: %v", err)
-			}
+		if err := SendEmbed(bot, sub.ChannelID, embed); err != nil {
+			reportError(bot, "winner notification", err, "guild", sub.ServerID, "channel", sub.ChannelID, "session", session.Location)
+			continue
 		}
-		SendEmbed(bot, sub.ChannelID, embed)
+		log.Printf("Sent winner notification for %s to server %s (channel %s)", session.Location, sub.ServerID, sub.ChannelID)
 		if err := updateWinnerNotification(sub.ServerID, sessionID, true); err != nil {
-			log.Printf("Failed to update winner notification: %v", err)
+			reportError(bot, "winner notification db", err, "guild", sub.ServerID, "channel", sub.ChannelID)
 		}
 	}
 }
@@ -2196,7 +2187,7 @@ func checkNotifications(bot *gofluxer.Bot, sessions []Session) {
 
 	subscriptions, err := getSubscriptions()
 	if err != nil {
-		log.Printf("Failed to get subscriptions: %v", err)
+		reportError(bot, "reminder subscriptions", err)
 		return
 	}
 
@@ -2207,21 +2198,21 @@ func checkNotifications(bot *gofluxer.Bot, sessions []Session) {
 			continue
 		}
 
-		SendEmbed(bot, sub.ChannelID, embed)
+		if err := SendEmbed(bot, sub.ChannelID, embed); err != nil {
+			reportError(bot, "race reminder", err, "guild", sub.ServerID, "channel", sub.ChannelID, "session", session.Location)
+			continue
+		}
+		log.Printf("Sent race reminder for %s to server %s (channel %s)", session.Location, sub.ServerID, sub.ChannelID)
 
-		err := updateNotification(
-			sub.ServerID,
-			fmt.Sprint(session.SessionKey),
-		)
-
-		if err != nil {
-			log.Printf("Failed to update notification: %v", err)
+		if err := updateNotification(sub.ServerID, fmt.Sprint(session.SessionKey)); err != nil {
+			reportError(bot, "reminder db", err, "guild", sub.ServerID, "channel", sub.ChannelID)
 		}
 	}
 }
 
 func main() {
 	godotenv.Load()
+	initErrorReporting()
 	if err := initDB(); err != nil {
 		log.Printf("database unavailable, continuing without subscriptions: %v", err)
 	}
@@ -2237,7 +2228,7 @@ func main() {
 		updateStatus := func() {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("panic in status update: %v", r)
+					reportError(bot, "status panic", fmt.Errorf("%v", r))
 				}
 			}()
 			status := getStatus()
@@ -2245,12 +2236,12 @@ func main() {
 			log.Println("Status:", status)
 
 			err := bot.SetStatus("online", &gofluxer.CustomStatus{
-				Text:   status,
+				Text:    status,
 				EmojiID: "1567114760195936256",
 			})
 
 			if err != nil {
-				log.Println("Presence error:", err)
+				reportError(bot, "presence", err)
 			}
 		}
 
@@ -2271,13 +2262,15 @@ func main() {
 		fluxerLatency, fluxerErr := measureLatency(bot.BaseURL+"/users/@me", bot.Token)
 		fluxerVal := fmtMs(fluxerLatency)
 		if fluxerErr != nil {
-			fluxerVal += " (error: " + fluxerErr.Error() + ")"
+			fluxerVal += " (unavailable)"
+			reportError(bot, "ping fluxer", fluxerErr, "guild", m.GuildID, "channel", m.ChannelID)
 		}
 
 		ofLatency, ofErr, ofCheckedAt, ofFresh := getJolpiPing()
 		ofVal := fmtMs(ofLatency)
 		if ofErr != nil {
-			ofVal += " (error: " + ofErr.Error() + ")"
+			ofVal += " (unavailable)"
+			reportError(bot, "ping jolpica", ofErr, "guild", m.GuildID, "channel", m.ChannelID)
 		}
 		if ofFresh {
 			ofVal += " (fresh)"
@@ -2304,7 +2297,7 @@ func main() {
 			memVal += fmt.Sprintf(" · System %.0f%% used (%.0f/%.0f MB free)", usedPct, availMB, totalMB)
 		}
 
-		SendEmbed(bot, m.ChannelID, Embed{
+		if err := SendEmbed(bot, m.ChannelID, Embed{
 			Title:       "Pong!",
 			URL:         siteURL,
 			Description: "Live latency and resource usage",
@@ -2317,7 +2310,9 @@ func main() {
 				{Name: "Uptime", Value: fmt.Sprintf("%s · %d goroutines", time.Since(startTime).Round(time.Second), runtime.NumGoroutine()), Inline: false},
 			},
 			Footer: &EmbedFooter{Text: "franz-hermann bot"},
-		})
+		}); err != nil {
+			reportError(bot, "command ping", err, "guild", m.GuildID, "channel", m.ChannelID)
+		}
 	}))
 
 	bot.AddCommand("help", asyncHandler(bot, func(m *gofluxer.Message, args []string) {
@@ -2360,7 +2355,8 @@ func main() {
 
 		standings, err := getDriverStandings()
 		if err != nil {
-			bot.SendMessage(m.ChannelID, "Failed to fetch driver standings: "+err.Error())
+			reportError(bot, "command ds", err, "guild", m.GuildID, "channel", m.ChannelID)
+			bot.SendMessage(m.ChannelID, "Couldn't fetch driver standings right now. Try again shortly.")
 			return
 		}
 		if len(standings) == 0 {
@@ -2399,7 +2395,8 @@ func main() {
 
 		standings, err := getConstructorStandings()
 		if err != nil {
-			bot.SendMessage(m.ChannelID, "Failed to fetch team standings: "+err.Error())
+			reportError(bot, "command ts", err, "guild", m.GuildID, "channel", m.ChannelID)
+			bot.SendMessage(m.ChannelID, "Couldn't fetch team standings right now. Try again shortly.")
 			return
 		}
 		if len(standings) == 0 {
@@ -2442,7 +2439,8 @@ func main() {
 			if errors.Is(err, errDriverNotFound) {
 				bot.SendMessage(m.ChannelID, fmt.Sprintf("I don't know driver #%d — there's no such driver in the latest race.", number))
 			} else {
-				bot.SendMessage(m.ChannelID, "Error fetching driver: "+err.Error())
+				reportError(bot, "command who", err, "guild", m.GuildID, "channel", m.ChannelID)
+				bot.SendMessage(m.ChannelID, "Couldn't look up that driver right now. Try again shortly.")
 			}
 			return
 		}
@@ -2503,13 +2501,13 @@ func main() {
 		}
 		// Only attach a thumbnail when OpenF1 actually gave us one.
 		// A thumbnail with an empty URL (e.g. reserve driver #50, whose
-		// headshot_url is null) makes the API reject the whole embed,
-		// and gofluxer's SendEmbed swallows that error — the user just
-		// sees silence.
+		// headshot_url is null) makes the API reject the whole embed.
 		if driver.HeadshotURL != "" {
 			embed.Thumbnail = &EmbedImage{URL: driver.HeadshotURL}
 		}
-		SendEmbed(bot, m.ChannelID, embed)
+		if err := SendEmbed(bot, m.ChannelID, embed); err != nil {
+			reportError(bot, "command who", err, "guild", m.GuildID, "channel", m.ChannelID)
+		}
 
 	}))
 
@@ -2520,18 +2518,16 @@ func main() {
 		}
 		last_race, err := getLastRace()
 		if err != nil {
-			// Was: fmt.Printf("... mate", err) with no %v -> prints %!(EXTRA *errors.errorString=...)
-			// and then fell through to send an embed with an empty last_race.
-			fmt.Printf("some issue with getting last race mate: %v\n", err)
-			bot.SendMessage(m.ChannelID, "Failed to get last race: "+err.Error())
+			reportError(bot, "command last", err, "guild", m.GuildID, "channel", m.ChannelID)
+			bot.SendMessage(m.ChannelID, "Couldn't get the last race right now. Try again shortly.")
 			return
 		}
-		fmt.Println(last_race)
 		description := fmt.Sprintf(" Last race was : %s", last_race)
 
 		last_standings, err := getLastStandings()
 		if err != nil {
-			bot.SendMessage(m.ChannelID, "Failed to fetch driver standings: "+err.Error())
+			reportError(bot, "command last", err, "guild", m.GuildID, "channel", m.ChannelID)
+			bot.SendMessage(m.ChannelID, "Couldn't fetch the last race results right now. Try again shortly.")
 			return
 		}
 		if len(last_standings) == 0 {
@@ -2581,8 +2577,8 @@ func main() {
 
 		next, err := getNextSession()
 		if err != nil {
-			log.Printf("getNextSession: %v", err)
-			bot.SendMessage(m.ChannelID, "Failed to fetch next session: "+err.Error())
+			reportError(bot, "command next", err, "guild", m.GuildID, "channel", m.ChannelID)
+			bot.SendMessage(m.ChannelID, "Couldn't fetch the next session right now. Try again shortly.")
 			return
 		}
 
@@ -2647,7 +2643,8 @@ func main() {
 
 		sessions, err := getAllSessions()
 		if err != nil {
-			bot.SendMessage(m.ChannelID, "Failed to fetch track info: "+err.Error())
+			reportError(bot, "command track", err, "guild", m.GuildID, "channel", m.ChannelID)
+			bot.SendMessage(m.ChannelID, "Couldn't fetch track info right now. Try again shortly.")
 			return
 		}
 
@@ -2729,16 +2726,16 @@ func main() {
 	}))
 
 	canManageFollow := func(m *gofluxer.Message) bool {
-	if m.GuildID == "" {
-		return false
+		if m.GuildID == "" {
+			return false
+		}
+		if bot.IsOwner(m) {
+			return true
+		}
+		return bot.HasPermission(m, gofluxer.PermissionManageChannels) ||
+			bot.HasPermission(m, gofluxer.PermissionManageMessages) ||
+			bot.HasPermission(m, gofluxer.PermissionManageEvents)
 	}
-	if bot.IsOwner(m) {
-		return true
-	}
-	return bot.HasPermission(m, gofluxer.PermissionManageChannels) ||
-		bot.HasPermission(m, gofluxer.PermissionManageMessages) ||
-		bot.HasPermission(m, gofluxer.PermissionManageEvents)
-}
 
 	bot.AddCommand("follow", asyncHandler(bot, func(m *gofluxer.Message, args []string) {
 		if !canManageFollow(m) {
@@ -2751,7 +2748,7 @@ func main() {
 
 		err := addSubscription(serverID, channelID, invokerID)
 		if err != nil {
-			log.Printf("Failed to add subscription: %v", err)
+			reportError(bot, "command follow", err, "guild", serverID, "channel", channelID)
 			bot.SendMessage(channelID, "Something went wrong while subscribing!")
 			return
 		}
@@ -2773,7 +2770,7 @@ func main() {
 
 		err := removeSubscription(server_id)
 		if err != nil {
-			log.Printf("%v", err)
+			reportError(bot, "command unfollow", err, "guild", server_id, "channel", m.ChannelID)
 			bot.SendMessage(m.ChannelID, "Something went wrong while unsubscribing!")
 			return
 		}
@@ -2789,6 +2786,7 @@ func main() {
 		}
 		sub, ok, err := getSubscription(m.GuildID)
 		if err != nil {
+			reportError(bot, "command substatus", err, "guild", m.GuildID, "channel", m.ChannelID)
 			bot.SendMessage(m.ChannelID, "Database unavailable right now.")
 			return
 		}
@@ -2807,30 +2805,40 @@ func main() {
 				}
 			}
 		}
-		bot.SendMessage(m.ChannelID, fmt.Sprintf("This server **is** subscribed.\nChannel ID: `%s`\nSet by (user ID): `%s`\nLast reminder session: %s", sub.ChannelID, sub.InvokerUserID, last))
+		winner := "none yet"
+		if sub.WinnerLastSessionID != "" {
+			winner = sub.WinnerLastSessionID
+			if races, rerr := getRaces(); rerr == nil {
+				if key, kerr := strconv.Atoi(sub.WinnerLastSessionID); kerr == nil {
+					if s, serr := getSessionFromKey(races, key); serr == nil {
+						winner = fmt.Sprintf("%s (%s, %s)", s.SessionName, s.Location, s.DateStart.Format("02 Jan 2006"))
+					}
+				}
+			}
+			if !sub.WinnerSent {
+				winner += " — pending"
+			}
+		}
+		bot.SendMessage(m.ChannelID, fmt.Sprintf("This server **is** subscribed.\nChannel ID: `%s`\nSet by (user ID): `%s`\nLast reminder session: %s\nLast winner session: %s", sub.ChannelID, sub.InvokerUserID, last, winner))
 	}
 	bot.AddCommand("substatus", asyncHandler(bot, subStatus))
 	bot.AddCommand("subscription", asyncHandler(bot, subStatus))
 
-	// Race reminder sender: check on startup and then every 5 minutes.
-	// getRaces() is cached (72h, or 35m while a race is underway), so
-	// this is mostly a DB read plus a time comparison.
+	// Reminder and winner notifications: on startup, then every 5 minutes.
 	go func() {
 		check := func() {
-			// A panic here must not kill the bot (unlike command handlers,
-			// this goroutine has no asyncHandler recover) — log it and
-			// let the next tick try again.
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("panic in race reminder check: %v", r)
+					reportError(bot, "notification panic", fmt.Errorf("%v", r))
 				}
 			}()
 			sessions, err := getRaces()
 			if err != nil {
-				log.Printf("Race reminder check failed: %v", err)
+				reportError(bot, "race notification check", err)
 				return
 			}
 			checkNotifications(bot, sessions)
+			checkWinnerNotifications(bot, sessions)
 		}
 		check()
 		ticker := time.NewTicker(5 * time.Minute)

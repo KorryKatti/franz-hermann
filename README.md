@@ -34,11 +34,17 @@ from 1 hour before lights out until 1 hour after the session ends, refreshed eve
 
 ## Configuration
 
-The only setting is the bot token, via `.env` in the project root:
+Settings live in `.env` in the project root:
 
 ```env
 BOT_TOKEN=your-token-here
+ERROR_GUILD_ID=
+ERROR_CHANNEL_ID=
 ```
+
+`ERROR_GUILD_ID` and `ERROR_CHANNEL_ID` are optional. When set, background
+failures are mirrored to that private channel (at most once per 30 minutes per
+error type). Users only see short, friendly command errors.
 
 Never commit `.env` — it's gitignored and excluded from the Docker build context
 (see `.dockerignore`). `.env.example` is a safe template to copy from.
